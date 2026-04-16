@@ -1,0 +1,122 @@
+###############################################################################
+# Docker integration for UFW, to be placed in /etc/ufw/after.rules.
+# This will...
+# - Prevent the docker daemon from bypassing UFW when exposing ports.
+# - Prevent docker containers from accessing services on the host or local network
+# - Allow docker containers to access certain ports on the host, see the
+#   ufw-after-input section at the end of the file.
+#
+# You can use UFW to...
+# - allow others to connec to a port exposed by docker, like any loca service:
+#   ufw allow 8000
+# - allow docker containers to connect to ports on the host (e.g. xdebug):
+#   ufw allow in on docker+ to any port 9003
+###############################################################################
+
+#
+# rules.input-after
+#
+# Rules that should be run after the ufw command line added rules. Custom
+# rules should be added to one of these chains:
+#   ufw-after-input
+#   ufw-after-output
+#   ufw-after-forward
+#
+
+# Don't delete these required lines, otherwise there will be errors
+*filter
+:ufw-after-input - [0:0]
+:ufw-after-output - [0:0]
+:ufw-after-forward - [0:0]
+# End required lines
+
+###############################################################################
+# BEGIN UFW DEFAULTS
+
+# don't log noisy services by default
+-A ufw-after-input -p udp --dport 137 -j ufw-skip-to-policy-input
+-A ufw-after-input -p udp --dport 138 -j ufw-skip-to-policy-input
+-A ufw-after-input -p tcp --dport 139 -j ufw-skip-to-policy-input
+-A ufw-after-input -p tcp --dport 445 -j ufw-skip-to-policy-input
+-A ufw-after-input -p udp --dport 67 -j ufw-skip-to-policy-input
+-A ufw-after-input -p udp --dport 68 -j ufw-skip-to-policy-input
+
+# don't log noisy broadcast
+-A ufw-after-input -m addrtype --dst-type BROADCAST -j ufw-skip-to-policy-input
+
+# don't delete the 'COMMIT' line or these rules won't be processed
+COMMIT
+# END UFW DEFAULTS
+
+###############################################################################
+# BEGIN DOCKER INTEGRATION
+# Inspired by <https://github.com/chaifeng/ufw-docker>
+*filter
+:ufw-user-forward - [0:0]
+:ufw-docker-logging-deny - [0:0]
+:DOCKER-USER - [0:0]
+
+# ufw-docker-logging-deny ###########################################
+-A ufw-docker-logging-deny -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix "[UFW DOCKER BLOCK] "
+-A ufw-docker-logging-deny -j DROP
+
+# DOCKER-USER #######################################################
+-A DOCKER-USER -j ufw-user-forward
+
+-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+-A DOCKER-USER -m conntrack --ctstate INVALID -j DROP
+
+# Allow forwarding between any Docker bridge interfaces (docker-to-docker)
+-A DOCKER-USER -i docker+ -o docker+ -j RETURN
+-A DOCKER-USER -i docker+ -o br+     -j RETURN
+-A DOCKER-USER -i br+     -o docker+ -j RETURN
+-A DOCKER-USER -i br+     -o br+     -j RETURN
+
+# Allow Docker containers to use DNS on the LAN (private IP ranges)
+-A DOCKER-USER -i docker+ -d 10.0.0.0/8 -p tcp --dport 53   -j ACCEPT
+-A DOCKER-USER -i docker+ -d 10.0.0.0/8 -p udp --dport 53   -j ACCEPT
+-A DOCKER-USER -i br+     -d 10.0.0.0/8 -p tcp --dport 53   -j ACCEPT
+-A DOCKER-USER -i br+     -d 10.0.0.0/8 -p udp --dport 53   -j ACCEPT
+
+-A DOCKER-USER -i docker+ -d 172.16.0.0/12 -p tcp --dport 53   -j ACCEPT
+-A DOCKER-USER -i docker+ -d 172.16.0.0/12 -p udp --dport 53   -j ACCEPT
+-A DOCKER-USER -i br+     -d 172.16.0.0/12 -p tcp --dport 53   -j ACCEPT
+-A DOCKER-USER -i br+     -d 172.16.0.0/12 -p udp --dport 53   -j ACCEPT
+
+-A DOCKER-USER -i docker+ -d 192.168.0.0/16 -p tcp --dport 53   -j ACCEPT
+-A DOCKER-USER -i docker+ -d 192.168.0.0/16 -p udp --dport 53   -j ACCEPT
+-A DOCKER-USER -i br+     -d 192.168.0.0/16 -p tcp --dport 53   -j ACCEPT
+-A DOCKER-USER -i br+     -d 192.168.0.0/16 -p udp --dport 53   -j ACCEPT
+
+# Block Docker containers from reaching LAN (private IP ranges)
+-A DOCKER-USER -i docker+ -d 10.0.0.0/8     -j ufw-docker-logging-deny
+-A DOCKER-USER -i docker+ -d 172.16.0.0/12  -j ufw-docker-logging-deny
+-A DOCKER-USER -i docker+ -d 192.168.0.0/16 -j ufw-docker-logging-deny
+-A DOCKER-USER -i br+     -d 10.0.0.0/8     -j ufw-docker-logging-deny
+-A DOCKER-USER -i br+     -d 172.16.0.0/12  -j ufw-docker-logging-deny
+-A DOCKER-USER -i br+     -d 192.168.0.0/16 -j ufw-docker-logging-deny
+
+# Allow Docker containers to reach the public internet
+-A DOCKER-USER -i docker+ -j RETURN
+-A DOCKER-USER -i br+     -j RETURN
+
+# Block all other new inbound connections to Docker containers
+-A DOCKER-USER -o docker+ -m conntrack --ctstate NEW -j ufw-docker-logging-deny
+-A DOCKER-USER -o br+     -m conntrack --ctstate NEW -j ufw-docker-logging-deny
+
+# ufw-after-input ###################################################
+# Allow Docker containers to reach host on DNS ports.
+# Additional ports can be allowed using an ufw command.
+# E.g. to allow allow PHP code to talk to xdebug an an IDE, use something like
+#   ufw allow in on docker+ to any port 9003
+-A ufw-after-input -i docker+ -p tcp --dport 53   -j ACCEPT
+-A ufw-after-input -i docker+ -p udp --dport 53   -j ACCEPT
+-A ufw-after-input -i br+     -p tcp --dport 53   -j ACCEPT
+-A ufw-after-input -i br+     -p udp --dport 53   -j ACCEPT
+
+# Block all other new connections from Docker containers to the host
+-A ufw-after-input -i docker+ -j ufw-docker-logging-deny
+-A ufw-after-input -i br+     -j ufw-docker-logging-deny
+
+COMMIT
+# END DOCKER INTEGRATION
