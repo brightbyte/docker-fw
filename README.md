@@ -46,6 +46,12 @@ Allow containers to connect to a port on the host (e.g. Xdebug):
 ufw allow in on docker+ to any port 9003
 ```
 
+
+Allow the docker bridge to connect to any unprivileged port on the host (e.g. Xdebug):
+```bash
+ufw allow in on br+ proto tcp to any port 1024:65535
+```
+
 ## Credits
 
 Inspired by [chaifeng/ufw-docker](https://github.com/chaifeng/ufw-docker).
