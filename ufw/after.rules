@@ -1,16 +1,18 @@
 ###############################################################################
-# Docker integration for UFW, to be placed in /etc/ufw/after.rules.
+# Docker/Podman integration for UFW, to be placed in /etc/ufw/after.rules.
 # This will...
-# - Prevent the docker daemon from bypassing UFW when exposing ports.
-# - Prevent docker containers from accessing services on the host or local network
-# - Allow docker containers to access certain ports on the host, see the
+# - Prevent the docker/podman daemon from bypassing UFW when exposing ports.
+# - Prevent containers from accessing services on the host or local network
+# - Allow containers to access certain ports on the host, see the
 #   ufw-after-input section at the end of the file.
 #
 # You can use UFW to...
-# - allow others to connec to a port exposed by docker, like any loca service:
+# - allow others to connec to a port exposed by a container, like any local service:
 #   ufw allow 8000
 # - allow docker containers to connect to ports on the host (e.g. xdebug):
 #   ufw allow in on docker+ to any port 9003
+# - Allow the podman to connect to any unprivileged port on the host:
+#   ufw allow in on podman+ proto tcp to any port 1024:65535
 ###############################################################################
 
 #
@@ -49,7 +51,7 @@ COMMIT
 # END UFW DEFAULTS
 
 ###############################################################################
-# BEGIN DOCKER INTEGRATION
+# BEGIN DOCKER/PODMAN INTEGRATION
 # Inspired by <https://github.com/chaifeng/ufw-docker>
 *filter
 :ufw-user-forward - [0:0]
@@ -66,29 +68,45 @@ COMMIT
 -A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
 -A DOCKER-USER -m conntrack --ctstate INVALID -j DROP
 
-# Allow forwarding between any Docker bridge interfaces (docker-to-docker)
+# Allow traffic between containers
+-A DOCKER-USER -i podman+ -o podman+ -j RETURN
+-A DOCKER-USER -i podman+ -o docker+ -j RETURN
+-A DOCKER-USER -i podman+ -o br+     -j RETURN
 -A DOCKER-USER -i docker+ -o docker+ -j RETURN
+-A DOCKER-USER -i docker+ -o podman+ -j RETURN
 -A DOCKER-USER -i docker+ -o br+     -j RETURN
 -A DOCKER-USER -i br+     -o docker+ -j RETURN
+-A DOCKER-USER -i br+     -o podman+ -j RETURN
 -A DOCKER-USER -i br+     -o br+     -j RETURN
 
-# Allow Docker containers to use DNS on the LAN (private IP ranges)
+# Allow containers to use DNS on the LAN (private IP ranges).
+# This covers routed (FORWARD) traffic to a resolver on another machine,
+# e.g. a home router; it is a carve-out from the LAN block below.
+-A DOCKER-USER -i podman+ -d 10.0.0.0/8 -p tcp --dport 53   -j ACCEPT
+-A DOCKER-USER -i podman+ -d 10.0.0.0/8 -p udp --dport 53   -j ACCEPT
 -A DOCKER-USER -i docker+ -d 10.0.0.0/8 -p tcp --dport 53   -j ACCEPT
 -A DOCKER-USER -i docker+ -d 10.0.0.0/8 -p udp --dport 53   -j ACCEPT
 -A DOCKER-USER -i br+     -d 10.0.0.0/8 -p tcp --dport 53   -j ACCEPT
 -A DOCKER-USER -i br+     -d 10.0.0.0/8 -p udp --dport 53   -j ACCEPT
 
+-A DOCKER-USER -i podman+ -d 172.16.0.0/12 -p tcp --dport 53   -j ACCEPT
+-A DOCKER-USER -i podman+ -d 172.16.0.0/12 -p udp --dport 53   -j ACCEPT
 -A DOCKER-USER -i docker+ -d 172.16.0.0/12 -p tcp --dport 53   -j ACCEPT
 -A DOCKER-USER -i docker+ -d 172.16.0.0/12 -p udp --dport 53   -j ACCEPT
 -A DOCKER-USER -i br+     -d 172.16.0.0/12 -p tcp --dport 53   -j ACCEPT
 -A DOCKER-USER -i br+     -d 172.16.0.0/12 -p udp --dport 53   -j ACCEPT
 
+-A DOCKER-USER -i podman+ -d 192.168.0.0/16 -p tcp --dport 53   -j ACCEPT
+-A DOCKER-USER -i podman+ -d 192.168.0.0/16 -p udp --dport 53   -j ACCEPT
 -A DOCKER-USER -i docker+ -d 192.168.0.0/16 -p tcp --dport 53   -j ACCEPT
 -A DOCKER-USER -i docker+ -d 192.168.0.0/16 -p udp --dport 53   -j ACCEPT
 -A DOCKER-USER -i br+     -d 192.168.0.0/16 -p tcp --dport 53   -j ACCEPT
 -A DOCKER-USER -i br+     -d 192.168.0.0/16 -p udp --dport 53   -j ACCEPT
 
-# Block Docker containers from reaching LAN (private IP ranges)
+# Block containers from reaching LAN (private IP ranges)
+-A DOCKER-USER -i podman+ -d 10.0.0.0/8     -j ufw-docker-logging-deny
+-A DOCKER-USER -i podman+ -d 172.16.0.0/12  -j ufw-docker-logging-deny
+-A DOCKER-USER -i podman+ -d 192.168.0.0/16 -j ufw-docker-logging-deny
 -A DOCKER-USER -i docker+ -d 10.0.0.0/8     -j ufw-docker-logging-deny
 -A DOCKER-USER -i docker+ -d 172.16.0.0/12  -j ufw-docker-logging-deny
 -A DOCKER-USER -i docker+ -d 192.168.0.0/16 -j ufw-docker-logging-deny
@@ -96,27 +114,35 @@ COMMIT
 -A DOCKER-USER -i br+     -d 172.16.0.0/12  -j ufw-docker-logging-deny
 -A DOCKER-USER -i br+     -d 192.168.0.0/16 -j ufw-docker-logging-deny
 
-# Allow Docker containers to reach the public internet
+# Allow containers to reach the public internet
+-A DOCKER-USER -i podman+ -j RETURN
 -A DOCKER-USER -i docker+ -j RETURN
 -A DOCKER-USER -i br+     -j RETURN
 
-# Block all other new inbound connections to Docker containers
+# Block all other new inbound connections to containers
+-A DOCKER-USER -o podman+ -m conntrack --ctstate NEW -j ufw-docker-logging-deny
 -A DOCKER-USER -o docker+ -m conntrack --ctstate NEW -j ufw-docker-logging-deny
 -A DOCKER-USER -o br+     -m conntrack --ctstate NEW -j ufw-docker-logging-deny
 
 # ufw-after-input ###################################################
-# Allow Docker containers to reach host on DNS ports.
-# Additional ports can be allowed using an ufw command.
-# E.g. to allow allow PHP code to talk to xdebug an an IDE, use something like
-#   ufw allow in on docker+ to any port 9003
+# Allow containers to reach the host itself on DNS ports (INPUT traffic).
+# Needed when the resolver runs on the host, e.g. podman's aardvark-dns
+# listening on the bridge gateway IP, or a local dnsmasq/systemd-resolved.
+-A ufw-after-input -i podman+ -p tcp --dport 53   -j ACCEPT
+-A ufw-after-input -i podman+ -p udp --dport 53   -j ACCEPT
 -A ufw-after-input -i docker+ -p tcp --dport 53   -j ACCEPT
 -A ufw-after-input -i docker+ -p udp --dport 53   -j ACCEPT
 -A ufw-after-input -i br+     -p tcp --dport 53   -j ACCEPT
 -A ufw-after-input -i br+     -p udp --dport 53   -j ACCEPT
 
+# Additional ports can be allowed using an ufw command.
+# E.g. to allow allow PHP code to talk to xdebug an an IDE, use something like
+#   ufw allow in on docker+ to any port 9003
+
 # Block all other new connections from Docker containers to the host
+-A ufw-after-input -i podman+ -j ufw-docker-logging-deny
 -A ufw-after-input -i docker+ -j ufw-docker-logging-deny
 -A ufw-after-input -i br+     -j ufw-docker-logging-deny
 
 COMMIT
-# END DOCKER INTEGRATION
+# END DOCKER/PODMAN RULES
