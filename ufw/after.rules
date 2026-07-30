@@ -51,7 +51,7 @@ COMMIT
 # END UFW DEFAULTS
 
 ###############################################################################
-# BEGIN DOCKER/PODMAN INTEGRATION
+# BEGIN DOCKER/PODMAN RULES
 # Inspired by <https://github.com/chaifeng/ufw-docker>
 *filter
 :ufw-user-forward - [0:0]

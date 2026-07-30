@@ -16,7 +16,7 @@ The design of the rules in `ufw/after.rules` is based on the following assumptio
 ## What these rules do
 The rules in `ufw/after.rules` will ensure that incoming traffic can only reach containers if UFW allows it, and containers can only connect to services on the host or local network if permitted by UFW rules. It will:
 
-- **Prevent Docker from bypassing UFW** for exposed ports — inbound connections to containers are subject to normal UFW rules (e.g. `ufw allow 8000`).
+- **Prevent Docker from bypassing UFW** for exposed ports — inbound connections to containers are subject to UFW route rules (e.g. `ufw route allow proto tcp from any to any port 8000`).
 - **Block containers from reaching the LAN** (RFC 1918 ranges: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`).
 - **Block containers from reaching the host** (host ports can be allowed with `ufw allow in on docker+ to any port <PORT>`).
 
@@ -32,15 +32,21 @@ NOTE: The containment rules DO NOT WORK for Docker or Podman running in "rootles
 ## Installation
 
 ```bash
+sudo cp --backup=numbered /etc/ufw/after.rules /etc/ufw/after.backup
 sudo cp ufw/after.rules /etc/ufw/after.rules
 sudo ufw reload
 ```
 
+Then [run tests](#testing) to confirm.
+
 ## Usage examples
 
-Allow external connections to a port exposed by a container (same as any local service):
+Allow external connections to a port published by a container. A published
+port is reached by *forwarded* traffic (DNAT'd to the container), so it is
+governed by UFW's route rules, not `ufw allow` (which only affects traffic
+to the host itself):
 ```bash
-ufw allow 8000
+ufw route allow proto tcp from any to any port 8000
 ```
 
 Allow containers to connect to a port on the host (e.g. Xdebug):
@@ -48,10 +54,13 @@ Allow containers to connect to a port on the host (e.g. Xdebug):
 ufw allow in on docker+ to any port 9003
 ```
 
-Allow podman to connect to any unprivileged port on the host:
+Allow podman to connect to (almost) any unprivileged port on the host:
 ```bash
-ufw allow in on podman+ proto tcp to any port 1024:65535
+ufw allow in on podman+ proto tcp to any port 1024:65499
 ```
+
+Note that ports 65500 and above are used by the self-test, allowing them will produce
+misleading results from `tests/host_tests.py`. So they are now allowed by the example above.
 
 ## Caveats
 
@@ -102,6 +111,13 @@ Even with those mappings disabled, a rootless container can reach host services
 bound to a wildcard or the LAN address by connecting to the host's LAN IP, and
 UFW cannot block it because the relayed connection travels over `lo`. Only
 services bound exclusively to `127.0.0.1` stay out of reach.
+
+## Testing
+
+The `tests/` directory contains a test suite that probes a running system for
+the outcomes described above and reports secure/insecure verdicts, including
+optional cross-host tests from a second machine on the LAN. See
+[tests/README.md](tests/README.md).
 
 ## Credits
 
