@@ -4,13 +4,14 @@ same LAN as the host under test, then run cross_host_tests.py <this-ip>
 over there.
 
 The orchestrator drives this script over a JSON-lines TCP control channel
-(default port 65510). The peer's own firewall must let the test host in:
-
-    sudo ufw allow from <test-host-ip> to any port 65510,65511 proto tcp
+(default port 65510). If the peer runs UFW, open the test ports with
+`sudo tests/ufw_setup.sh` (the same script used on the host opens the peer
+ports too); undo with `ufw_teardown.sh`.
 
 This is an unauthenticated test tool: it accepts commands from the address
 given via --allow-from (or, failing that, from the first client to connect).
-Stop it with Ctrl-C, and delete the ufw rule again afterwards.
+Always pass --allow-from: it is the access control for the channel, since
+ufw_setup.sh opens the port to any address. Stop it with Ctrl-C.
 """
 
 import argparse
@@ -27,21 +28,34 @@ from fwtest.protocol import CONTROL_PORT
 
 
 class RecordingListener:
-    """TCP listener that records every accepted connection."""
+    """TCP listener (both address families) that records every accepted
+    connection."""
 
     def __init__(self, port):
         self.port = port
         self.connections = []  # list of {source, time}
-        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server.bind(('0.0.0.0', port))
-        self.server.listen(8)
-        threading.Thread(target=self._accept_loop, daemon=True).start()
+        self.servers = []
+        for family, addr in ((socket.AF_INET, '0.0.0.0'),
+                             (socket.AF_INET6, '::')):
+            server = socket.socket(family, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == socket.AF_INET6:
+                server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            try:
+                server.bind((addr, port))
+            except OSError:
+                if family == socket.AF_INET6:
+                    continue   # no IPv6 here; v4 listener still records
+                raise
+            server.listen(8)
+            self.servers.append(server)
+            threading.Thread(target=self._accept_loop, args=(server,),
+                             daemon=True).start()
 
-    def _accept_loop(self):
+    def _accept_loop(self, server):
         while True:
             try:
-                conn, addr = self.server.accept()
+                conn, addr = server.accept()
             except OSError:
                 return
             self.connections.append({'source': addr[0], 'time': time.time()})
@@ -53,7 +67,8 @@ class RecordingListener:
             conn.close()
 
     def close(self):
-        self.server.close()
+        for server in self.servers:
+            server.close()
 
 
 def detect_own_ip(target):
@@ -69,6 +84,19 @@ def detect_own_ip(target):
         sock.close()
 
 
+def detect_own_ip6():
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    try:
+        sock.connect(('2606:4700:4700::1111', 9))
+        ip = sock.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        sock.close()
+    import ipaddress
+    return None if ipaddress.ip_address(ip).is_link_local else ip
+
+
 class Peer:
     def __init__(self):
         self.listeners = {}
@@ -76,7 +104,8 @@ class Peer:
     def handle(self, msg):
         cmd = msg.get('cmd')
         if cmd == 'hello':
-            return {'ok': True, 'version': 1}
+            return {'ok': True, 'version': 1,
+                    'ip': detect_own_ip(None), 'ip6': detect_own_ip6()}
         if cmd == 'listen':
             port = int(msg['port'])
             if port not in self.listeners:
@@ -120,9 +149,12 @@ def serve(args):
     if own_ip:
         print(f"This machine's IP address (enter this at the "
               f'cross_host_tests.py prompt): {own_ip}')
-    print('If UFW is active on this machine, allow the test host in:')
-    print(f'    sudo ufw allow from {allow_from or "<test-host-ip>"} '
-          f'to any port {args.control_port},65511 proto tcp')
+    own_ip6 = detect_own_ip6()
+    if own_ip6:
+        print(f"This machine's IPv6 address: {own_ip6}")
+    print('If UFW is active on this machine, open the test ports (the same '
+          'setup script used on the host opens the peer ports too):')
+    print('    sudo tests/ufw_setup.sh          (undo with ufw_teardown.sh)')
     print('Waiting for the orchestrator; stop with Ctrl-C.')
 
     # One Peer for the process lifetime: listeners persist across control

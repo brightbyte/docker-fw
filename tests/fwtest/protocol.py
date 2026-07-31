@@ -4,7 +4,8 @@ remote_peer.py."""
 import json
 import socket
 
-CONTROL_PORT = 65510
+CONTROL_PORT = 65510      # orchestrator <-> remote_peer control channel
+PORT_PEER_PROBE = 65511   # peer listener: the container -> LAN egress target
 
 
 def send(fp, obj):

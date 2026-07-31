@@ -61,10 +61,14 @@ def _dns_response_ok(data, qid):
     return rid == qid and bool(flags & 0x8000)  # QR bit: it is a response
 
 
+def _udp_family(host):
+    return socket.AF_INET6 if ':' in host else socket.AF_INET
+
+
 def dns_udp_probe(host, port=53, timeout=TIMEOUT, qname='example.com'):
     qid = random.randrange(0x10000)
     query = _dns_query(qname, qid)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock = socket.socket(_udp_family(host), socket.SOCK_DGRAM)
     sock.settimeout(timeout)
     try:
         # connect() so ICMP port-unreachable surfaces as ConnectionRefusedError

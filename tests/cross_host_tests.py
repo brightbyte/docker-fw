@@ -3,8 +3,10 @@
 engine bypasses UFW. Independent of host_tests.py; run unprivileged on the
 host under test:
 
+    sudo tests/ufw_setup.sh         # once, before testing
     python3 tests/cross_host_tests.py [PEER-IP] [--engine docker|podman|sudo-podman]
-                                      [--no-guided] [--json] [--rebuild]
+                                      [--json] [--rebuild]
+    sudo tests/ufw_teardown.sh      # once, when done
 
 Without PEER-IP, the script prints the remote_peer.py invocation to run on
 the other host (including this host's IP) and then asks for the peer's IP,
@@ -12,154 +14,189 @@ which remote_peer.py prints when it starts. The peer helper also prints the
 ufw command to open its firewall for the control channel.
 
 Tests: container -> other LAN host must be blocked (the peer reports whether
-anything arrived), and LAN peer -> published container port must be blocked
-until explicitly allowed with ufw (guided step, with the same stash/restore
-flow as host_tests.py).
+anything arrived); the LAN peer must not reach the unopened published port
+but must reach the one ufw_setup.sh opened with `ufw route allow`.
 """
 
 import argparse
+import json
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import host_tests
 from host_tests import (
-    Finding, SECURE, INSECURE, INCONCLUSIVE, INFO,
-    PORT_PUBLISHED, PORT_PEER_PROBE, LISTENER_NAME, UfwStash,
-    containment_actions, prompt_step, quiet, verdict_allowed,
+    Finding, SECURE, INSECURE, INCONCLUSIVE, INFO, OK, RESTRICTED,
+    PORT_PUBLISHED, LISTENER_NAME,
+    containment_actions, quiet,
 )
 from fwtest import probes, report
-from fwtest.protocol import CONTROL_PORT, PeerControl
+from fwtest.protocol import CONTROL_PORT, PORT_PEER_PROBE, PeerControl
+from fwtest.ufw import PORT_PUBLISHED_OPEN, require_setup, teardown_reminder
 
 SECTION = 'Cross-host'
 
 
 def setup_actions(host):
+    # the peer needs remote_peer.py running and the test ports open in its ufw;
+    # ufw_setup.sh opens the peer ports too, so the same script serves here
     return [
         f'On the peer: python3 tests/remote_peer.py --allow-from {host.lan_ip}',
-        f'On the peer: sudo ufw allow from {host.lan_ip} to any port '
-        f'{CONTROL_PORT},{PORT_PEER_PROBE} proto tcp',
+        'On the peer: sudo tests/ufw_setup.sh   (opens the peer test ports; '
+        'undo with ufw_teardown.sh)',
     ]
 
 
-def egress_test(engine, peer, peer_ip, host, findings):
-    """container -> other LAN host: must be blocked."""
+def engine_manages_ipv6(engine):
+    """Best-effort: does the engine forward/publish container IPv6 at the
+    firewall level? A '::' host binding on a published port means it does
+    (docker: ip6tables enabled). Returns True/False, or None if undetermined.
+    For podman this is weaker evidence -- netavark manages its own chains and
+    may not bind '::' or route through DOCKER-USER -- so the egress verdict
+    relies on the differential control below, not on this."""
+    p = host_tests.run(engine.cmd('inspect', LISTENER_NAME),
+                       capture=True, check=False, echo=False)
+    try:
+        ports = json.loads(p.stdout)[0]['NetworkSettings']['Ports'] or {}
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None
+    for bindings in ports.values():
+        for binding in bindings or []:
+            if binding.get('HostIp') in ('::', '::0'):
+                return True
+    return False
+
+
+def egress_test(engine, peer, peer_ip, peer_ip6, host, findings):
+    """container -> other LAN host must be blocked. The peer also listens on
+    the route-allowed port (PORT_PUBLISHED_OPEN): container egress to it is a
+    positive control proving egress WOULD work when permitted, so a blocked
+    result on PORT_PEER_PROBE is a real block, not absent connectivity."""
     peer.call(cmd='reset')
     peer.call(cmd='listen', port=PORT_PEER_PROBE)
-    # sanity: the host itself must be able to reach the peer's test port,
-    # otherwise a blocked container probe would prove nothing
-    sanity = probes.tcp_probe(peer_ip, PORT_PEER_PROBE)
-    if sanity != 'connected':
+    peer.call(cmd='listen', port=PORT_PUBLISHED_OPEN)
+    _egress_one(engine, peer, peer_ip, host, findings, family='4')
+    if host.ipv6 and peer_ip6:
+        _egress_one(engine, peer, peer_ip6, host, findings, family='6')
+
+
+def _egress_one(engine, peer, target, host, findings, family):
+    suffix = '' if family == '4' else ' over IPv6'
+    fid = 'peer-egress' if family == '4' else 'peer-egress6'
+    title = f'Container -> other LAN host{suffix} (port {PORT_PEER_PROBE})'
+    # sanity: this host must itself reach the peer on both ports, otherwise the
+    # peer-side firewall is interfering and neither result would mean anything
+    unreachable = [p for p in (PORT_PEER_PROBE, PORT_PUBLISHED_OPEN)
+                   if probes.tcp_probe(target, p) != 'connected']
+    if unreachable:
         findings.append(Finding(
-            'peer-egress',
-            f'Container -> other LAN host (port {PORT_PEER_PROBE})',
-            INCONCLUSIVE,
-            observed=f'host itself: {sanity}',
-            meaning='This host cannot reach the peer test port, so a blocked '
-                    'container probe would prove nothing. The peer-side '
-                    'firewall probably interferes.',
-            actions=setup_actions(host)[1:2], section=SECTION))
+            fid, title, INCONCLUSIVE,
+            observed=f'host cannot reach peer port(s) {unreachable}',
+            meaning='This host cannot reach the peer on these ports, so the '
+                    'container probes would prove nothing. Open them on the '
+                    'peer\'s ufw for this host'
+                    + (' (including this host\'s IPv6 address).'
+                       if family == '6' else '.'),
+            actions=setup_actions(host), section=SECTION))
         return
-    before = len(peer.call(cmd='connections',
-                           port=PORT_PEER_PROBE)['connections'])
+
+    def arrivals(port):
+        return len(peer.call(cmd='connections', port=port)['connections'])
+
+    peer.call(cmd='reset')
+    before_ctrl, before_test = arrivals(PORT_PUBLISHED_OPEN), arrivals(PORT_PEER_PROBE)
     _, results = host_tests.run_container_probes(engine, [
-        {'id': 'peer', 'kind': 'tcp', 'host': peer_ip,
-         'port': PORT_PEER_PROBE},
+        {'id': 'ctrl', 'kind': 'tcp', 'host': target,
+         'port': PORT_PUBLISHED_OPEN},
+        {'id': 'test', 'kind': 'tcp', 'host': target, 'port': PORT_PEER_PROBE},
     ])
-    outcome = results['peer']['outcome']
-    after = len(peer.call(cmd='connections',
-                          port=PORT_PEER_PROBE)['connections'])
-    reached = outcome == 'connected' or after > before
-    findings.append(Finding(
-        'peer-egress', f'Container -> other LAN host (port {PORT_PEER_PROBE})',
-        INSECURE if reached else
-        SECURE if outcome == 'timeout' else INCONCLUSIVE,
-        observed=f'{outcome}; peer saw {after - before} new connection(s)',
-        meaning='Container traffic reached another machine on the LAN.'
-        if reached else
-        'Containers cannot reach other machines on the LAN.',
-        actions=containment_actions(engine) if reached else [],
-        section=SECTION))
+    egress_works = (results['ctrl']['outcome'] == 'connected'
+                    or arrivals(PORT_PUBLISHED_OPEN) > before_ctrl)
+    reached = (results['test']['outcome'] == 'connected'
+               or arrivals(PORT_PEER_PROBE) > before_test)
+
+    if reached:
+        findings.append(Finding(
+            fid, title, INSECURE,
+            observed=f"reached the peer ({results['test']['outcome']})",
+            meaning='Container traffic reached another machine on the LAN.',
+            actions=containment_actions(engine), section=SECTION))
+    elif not egress_works:
+        detail = ''
+        if family == '6' and engine_manages_ipv6(engine) is False:
+            detail = (' The engine does not appear to forward container IPv6 '
+                      '(for docker, set "ip6tables": true in daemon.json; '
+                      'podman/netavark manages its own chains).')
+        findings.append(Finding(
+            fid, title, INCONCLUSIVE,
+            observed=f"blocked, but the route-allowed control port was also "
+                     f"unreached ({results['ctrl']['outcome']})",
+            meaning='The container could not reach the peer even on the '
+                    'route-allowed port, so it has no working '
+                    + ('IPv6 ' if family == '6' else '')
+                    + 'egress path to test the block against; a blocked result '
+                    'cannot be told apart from absent connectivity.' + detail,
+            actions=[], section=SECTION))
+    else:
+        findings.append(Finding(
+            fid, title, SECURE,
+            observed=f"blocked ({results['test']['outcome']}); egress on the "
+                     "route-allowed port works",
+            meaning='Containers cannot reach other machines on the LAN. Egress '
+                    'on the route-allowed port confirms the container could '
+                    'otherwise reach the peer, so this is a real block.',
+            actions=[], section=SECTION))
 
 
 def inbound_test(engine, peer, host, findings):
-    """LAN peer -> published container port: must be blocked by UFW.
-    Returns the probe outcome."""
-    outcome = peer.call(cmd='probe', host=host.lan_ip,
-                        port=PORT_PUBLISHED)['outcome']
+    """LAN peer -> published container ports. The unopened port must be
+    blocked by UFW; the port ufw_setup.sh opened with `ufw route allow` must
+    be reachable. No rule is toggled during the run."""
+    for family, host_ip in (('4', host.lan_ip),
+                            ('6', host.lan_ip6 if host.ipv6 else None)):
+        if not host_ip:
+            continue
+        _inbound_blocked(peer, host_ip, engine, findings, family)
+        _inbound_open(peer, host_ip, findings, family)
+
+
+def _inbound_blocked(peer, host_ip, engine, findings, family):
+    suffix = '' if family == '4' else ' over IPv6'
+    fid = 'peer-inbound' if family == '4' else 'peer-inbound6'
+    outcome = peer.call(cmd='probe', host=host_ip, port=PORT_PUBLISHED)['outcome']
     findings.append(Finding(
-        'peer-inbound',
-        f'LAN peer -> published container port {PORT_PUBLISHED}',
+        fid, f'LAN peer -> unopened published port {PORT_PUBLISHED}{suffix}',
         INSECURE if outcome == 'connected' else SECURE,
         observed=outcome,
         meaning='The container engine published this port past UFW; every '
                 'published port on this host is open to the network.'
         if outcome == 'connected' else
-        'Published container ports are subject to UFW like any host service.',
-        actions=containment_actions(engine) if outcome == 'connected' else
-        [f'To expose a published port: sudo ufw allow {PORT_PUBLISHED}/tcp'],
+        'Published container ports are subject to UFW like any host service '
+        '(this port has no route rule, and is blocked).',
+        actions=containment_actions(engine) if outcome == 'connected' else [],
         section=SECTION))
-    return outcome
 
 
-def guided_flip(peer, host, findings, stash):
-    """Verify that a published port can be opened deliberately with ufw."""
-    allow_cmd = (f'sudo ufw route allow proto tcp from any to any '
-                 f'port {PORT_PUBLISHED}')
-    stash.ensure()
-    if not prompt_step('This step verifies that a published port can be '
-                       'opened with ufw. A published port is reached by '
-                       'forwarded traffic, so it needs a route rule (not '
-                       'plain "ufw allow", which only affects the host '
-                       f'itself). In another terminal, run:\n\n    {allow_cmd}'):
-        return
-    stash.note(f'sudo ufw route delete allow proto tcp from any to any '
-               f'port {PORT_PUBLISHED}')
-    outcome = peer.call(cmd='probe', host=host.lan_ip,
-                        port=PORT_PUBLISHED)['outcome']
+def _inbound_open(peer, host_ip, findings, family):
+    suffix = '' if family == '4' else ' over IPv6'
+    fid = 'peer-inbound-open' if family == '4' else 'peer-inbound-open6'
+    outcome = peer.call(cmd='probe', host=host_ip,
+                        port=PORT_PUBLISHED_OPEN)['outcome']
     findings.append(Finding(
-        'peer-inbound-allowed',
-        f'LAN peer -> published port {PORT_PUBLISHED} with allow rule active',
-        verdict_allowed(outcome), observed=outcome,
-        meaning='A published container port can be opened to the LAN with a '
-                'ufw route rule, as intended.'
+        fid, f'LAN peer -> route-opened published port {PORT_PUBLISHED_OPEN}'
+        f'{suffix} (opened by setup)',
+        OK if outcome == 'connected' else RESTRICTED,
+        observed=outcome,
+        meaning='A published port opened with "ufw route allow" is reachable '
+                'from the LAN, as intended: the escape hatch works.'
         if outcome == 'connected' else
-        'The route rule did not open the forwarded path. Check that the '
-        'DOCKER-USER chain jumps to ufw-user-forward (sudo iptables -L '
-        'DOCKER-USER -n) and that the rule was added.',
+        f'Published port {PORT_PUBLISHED_OPEN} is not reachable even though '
+        'setup opened it. Either ufw_setup.sh has not run, or (if only IPv6 '
+        'fails) the engine did not publish the port on IPv6.',
+        actions=[] if outcome == 'connected' else
+        ['Run: sudo tests/ufw_setup.sh',
+         'Verify the rule with: sudo ufw show added'],
         section=SECTION))
-    # rule removal happens in restore()
-
-
-def restore(peer_ip, host, findings, stash, interrupted):
-    """Announce the restore, then re-verify from the peer that the
-    published port is blocked again."""
-    if not host_tests.restore_announce(findings, stash, interrupted):
-        return
-    try:
-        peer = PeerControl(peer_ip)
-        peer.call(cmd='hello')
-        outcome = peer.call(cmd='probe', host=host.lan_ip,
-                            port=PORT_PUBLISHED)['outcome']
-        peer.close()
-        findings.append(Finding(
-            'cleanup-peer',
-            f'LAN peer -> published port {PORT_PUBLISHED} after restore',
-            SECURE if outcome != 'connected' else INSECURE,
-            observed=outcome,
-            meaning='Restore verified; the published port is blocked again.'
-            if outcome != 'connected' else
-            'The published port is still open; a test rule appears to still '
-            'be active. Check: sudo ufw status numbered',
-            section='Cleanup'))
-    except (OSError, RuntimeError) as e:
-        findings.append(Finding(
-            'cleanup-peer',
-            f'LAN peer -> published port {PORT_PUBLISHED} after restore',
-            INCONCLUSIVE, observed=str(e),
-            meaning='Could not re-probe from the peer after the restore; '
-                    'check manually: sudo ufw status numbered',
-            section='Cleanup'))
 
 
 def print_peer_instructions(host):
@@ -168,10 +205,11 @@ def print_peer_instructions(host):
     print()
     print(f'    python3 tests/remote_peer.py --allow-from {host.lan_ip}')
     print()
-    print('If UFW is active there, also allow this host in:')
     print()
-    print(f'    sudo ufw allow from {host.lan_ip} to any port '
-          f'{CONTROL_PORT},{PORT_PEER_PROBE} proto tcp')
+    print('If UFW is active there, open the test ports (same script as on the '
+          'host):')
+    print()
+    print('    sudo tests/ufw_setup.sh')
     print()
     print("remote_peer.py prints the peer's IP address when it starts.")
 
@@ -233,8 +271,6 @@ def parse_args():
     parser.add_argument('--engine', choices=('docker', 'podman', 'sudo-podman'),
                         help='podman = rootless (plain podman); '
                              'sudo-podman = rootful podman via sudo')
-    parser.add_argument('--no-guided', action='store_true',
-                        help='skip interactive steps that ask for sudo ufw commands')
     parser.add_argument('--json', action='store_true',
                         help='machine-readable findings on stdout')
     parser.add_argument('--rebuild', action='store_true',
@@ -244,6 +280,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    require_setup()   # checks ufw_setup.sh has run (backups present, not stale)
     engine = host_tests.make_engine(host_tests.choose_engine_name(args))
     engine.rootless = host_tests.engine_is_rootless(engine)
 
@@ -265,22 +302,19 @@ def main():
     if not args.peer:
         args.peer = prompt_for_peer(host)
 
-    stash = UfwStash()
-    interrupted = False
+    network_created = False
     try:
         host_tests.ensure_image(engine, args.rebuild)
+        network_created = host_tests.ensure_test_network(engine)
         host_tests.start_listener_container(engine)
 
-        # args.peer is updated so the restore step reconnects to the IP
-        # that actually worked
+        # args.peer is updated to whichever IP actually connected
         peer, args.peer = connect_peer(args.peer, host, findings)
         if peer:
             try:
-                egress_test(engine, peer, args.peer, host, findings)
-                outcome = inbound_test(engine, peer, host, findings)
-                if outcome != 'connected' and not args.no_guided \
-                        and sys.stdin.isatty():
-                    guided_flip(peer, host, findings, stash)
+                peer_ip6 = peer.call(cmd='hello').get('ip6')
+                egress_test(engine, peer, args.peer, peer_ip6, host, findings)
+                inbound_test(engine, peer, host, findings)
             except (OSError, RuntimeError) as e:
                 findings.append(Finding(
                     'peer-error', 'Communication with the remote peer',
@@ -294,27 +328,22 @@ def main():
             finally:
                 peer.close()
     except KeyboardInterrupt:
-        interrupted = True
         print('\nInterrupted.')
         findings.append(Finding(
             'interrupted', 'Run interrupted by user', INFO,
             meaning='Later tests did not run; the findings below are '
                     'partial.', section='Environment'))
     finally:
-        try:
-            # needs the listener container still up for re-verification
-            restore(args.peer, host, findings, stash, interrupted)
-        except KeyboardInterrupt:
-            print('\nInterrupted again; any outstanding cleanup commands '
-                  'were printed above.')
-        finally:
-            quiet(engine.cmd('rm', '-f', LISTENER_NAME))
+        quiet(engine.cmd('rm', '-f', LISTENER_NAME))
+        if network_created:
+            host_tests.remove_test_network(engine)
 
     print()
     if args.json:
         print(report.render_json(findings))
     else:
         print(report.render_text(findings))
+    teardown_reminder()
     return report.exit_code(findings)
 
 

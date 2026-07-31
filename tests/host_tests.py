@@ -2,10 +2,13 @@
 """Probe a running system for the security outcomes promised by
 ufw/after.rules (see the top-level README) and report verdicts.
 
-Run unprivileged on the host under test:
+Run ufw_setup.sh once first (it opens the ports these tests expect to be
+reachable and backs up the ufw rules), then run unprivileged on the host:
 
+    sudo tests/ufw_setup.sh         # once, before testing
     python3 tests/host_tests.py [--engine docker|podman|sudo-podman]
-                                [--no-internet] [--no-guided] [--json]
+                                [--no-internet] [--json]
+    sudo tests/ufw_teardown.sh      # once, when done
 
 Inbound exposure to the LAN cannot be tested from the host itself; that is
 a separate script, tests/cross_host_tests.py, run against a second machine.
@@ -14,8 +17,8 @@ a separate script, tests/cross_host_tests.py, run against a second machine.
 rootful engine. All engines are probed with the same tests and judged by
 the same verdict rules; only the explanations and hints differ.
 
-The script never changes firewall state itself; steps that need root are
-printed as copy-paste sudo commands with interactive confirmation.
+The runs themselves never change firewall state (that is ufw_setup.sh /
+ufw_teardown.sh); they warn if the setup has not run or looks stale.
 Container engine commands may be run via sudo where unavoidable
 (sudo-podman, or docker without socket access); every command is echoed
 before use.
@@ -37,21 +40,24 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fwtest import probes, report
 from fwtest.report import (Finding, SECURE, INSECURE, OK, RESTRICTED,
                            INCONCLUSIVE, SKIPPED, INFO)
+from fwtest.ufw import (PORT_HOST_OPEN, PORT_PUBLISHED_OPEN,
+                        require_setup, teardown_reminder)
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE = 'docker-fw-test'
 LISTENER_NAME = 'fwtest-listener'
 
-PORT_HOST_BLOCKED = 65500   # host listener, wildcard bind: must be unreachable
+PORT_HOST_BLOCKED = 65500   # host listener, wildcard bind: must stay blocked
 PORT_HOST_LOOPBACK = 65501  # host listener, 127.0.0.1 bind: must be unreachable
-PORT_PUBLISHED = 65502      # published by container A: LAN-inbound test
+PORT_PUBLISHED = 65502      # published by container A: must stay blocked
 PORT_C2C = 65503            # container A internal: container-to-container test
-PORT_GUIDED = 65504         # host listener: ufw escape-hatch test
-PORT_PEER_CONTROL = 65510   # remote_peer.py control channel
-PORT_PEER_PROBE = 65511     # remote peer listener: container-to-LAN test
+# PORT_HOST_OPEN (65504) and PORT_PUBLISHED_OPEN (65505) are opened by
+# ufw_setup.sh; the runners check they are reachable (the escape hatches).
+# The peer ports (65510 control, 65511 probe) live in fwtest.protocol.
 
 INTERNET_TCP = ('1.1.1.1', 443)
 INTERNET_DNS = '9.9.9.9'
+INTERNET_TCP6 = '[2606:4700:4700::1111]:443'   # Cloudflare, v6 literal
 
 RFC1918 = [ipaddress.ip_network(n)
            for n in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')]
@@ -146,9 +152,20 @@ def engine_is_rootless(engine):
 # --- host environment --------------------------------------------------------
 
 class HostEnv:
-    def __init__(self):
+    def __init__(self, probe_internet=True):
         self.gateway, self.lan_iface = self._default_route()
         self.lan_ip = self._lan_ip()
+        self.gateway6 = self._default_route6()
+        self.lan_ip6 = self._lan_ip6()
+        self.ipv6 = self.lan_ip6 is not None
+        # whether the host itself can reach the internet. If the host can't,
+        # neither can a container (it routes through the host), so the
+        # container internet checks become uninformative. Used only to
+        # interpret those results, never to assert a v6 block is real. None
+        # means "not probed" (--no-internet, or no host v6 for internet6).
+        self.internet4 = self._internet4() if probe_internet else None
+        self.internet6 = (self._internet6()
+                          if self.ipv6 and probe_internet else None)
         self.dns_servers = self._dns_servers()
         self.lan_dns = [ip for ip in self.dns_servers if self._is_rfc1918(ip)]
         self.loopback_dns = [ip for ip in self.dns_servers
@@ -186,6 +203,55 @@ class HostEnv:
             return None
         finally:
             sock.close()
+
+    @staticmethod
+    def _default_route6():
+        # /proc/net/ipv6_route: default route has an all-zero destination with
+        # prefixlen 0 and the RTF_GATEWAY flag (0x0002) set. IPv6 default
+        # gateways are typically link-local; those need a zone id to be a
+        # usable address, so qualify them with the route's interface.
+        try:
+            with open('/proc/net/ipv6_route') as f:
+                for line in f:
+                    fields = line.split()
+                    if len(fields) < 10:
+                        continue
+                    dest, plen, nexthop = fields[0], fields[1], fields[4]
+                    if dest == '0' * 32 and plen == '00' \
+                            and int(fields[8], 16) & 0x2:
+                        packed = bytes.fromhex(nexthop)
+                        if packed != b'\x00' * 16:
+                            addr = socket.inet_ntop(socket.AF_INET6, packed)
+                            if ipaddress.ip_address(addr).is_link_local:
+                                addr = f'{addr}%{fields[9]}'
+                            return addr
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def _lan_ip6(self):
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        try:
+            # the target only steers the routing lookup (no packet is sent);
+            # a global literal works regardless of whether the default
+            # gateway is a link-local address
+            sock.connect(('2606:4700:4700::1111', 9))
+            ip = sock.getsockname()[0]
+        except OSError:
+            return None
+        finally:
+            sock.close()
+        # a link-local source means there is no routable IPv6 on this host
+        return None if ipaddress.ip_address(ip).is_link_local else ip
+
+    @staticmethod
+    def _internet4():
+        return probes.tcp_probe(INTERNET_TCP[0], INTERNET_TCP[1]) == 'connected'
+
+    @staticmethod
+    def _internet6():
+        host, port = INTERNET_TCP6.rsplit(':', 1)
+        return probes.tcp_probe(host.strip('[]'), int(port)) == 'connected'
 
     @staticmethod
     def _dns_servers():
@@ -228,8 +294,16 @@ class HostEnv:
         print('Environment:')
         print('  engine:          {} ({})'.format(engine.flavor, ' '.join(engine.base)))
         print('  rootless:        %s' % ('yes' if engine.rootless else 'no'))
+        reach = {True: 'yes', False: 'no', None: 'not probed'}
         print(f'  LAN interface:   {self.lan_iface}, IP {self.lan_ip}')
         print(f'  default gateway: {self.gateway}')
+        print(f'  internet (v4):   {reach[self.internet4]}')
+        if self.ipv6:
+            print(f'  IPv6 address:    {self.lan_ip6}')
+            print(f'  IPv6 gateway:    {self.gateway6}')
+            print(f'  IPv6 internet:   {reach[self.internet6]}')
+        else:
+            print('  IPv6:            not available on this host')
         print('  DNS servers:     %s' % (', '.join(self.dns_servers) or 'none detected'))
         installed = {True: 'yes', False: 'NO', None: 'unknown (file not readable)'}
         print(f'  after.rules has DOCKER-USER markers: {installed[self.rules_installed]}')
@@ -252,18 +326,28 @@ def _accept_loop(server):
 
 
 class HostListeners:
-    BINDS = [('0.0.0.0', PORT_HOST_BLOCKED),
-             ('127.0.0.1', PORT_HOST_LOOPBACK),
-             ('0.0.0.0', PORT_GUIDED)]
+    # (family, address, port). The wildcard ports also get a v6 bind so the
+    # IPv6 "must be blocked" probes have a live target to distinguish a
+    # firewall drop from nothing-listening.
+    BINDS = [(socket.AF_INET,  '0.0.0.0',   PORT_HOST_BLOCKED),
+             (socket.AF_INET6, '::',        PORT_HOST_BLOCKED),
+             (socket.AF_INET,  '127.0.0.1', PORT_HOST_LOOPBACK),
+             (socket.AF_INET6, '::1',       PORT_HOST_LOOPBACK),
+             (socket.AF_INET,  '0.0.0.0',   PORT_HOST_OPEN),
+             (socket.AF_INET6, '::',        PORT_HOST_OPEN)]
 
     def __init__(self):
         self.servers = []
-        for addr, port in self.BINDS:
-            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        for family, addr, port in self.BINDS:
+            server = socket.socket(family, socket.SOCK_STREAM)
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == socket.AF_INET6:
+                server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
             try:
                 server.bind((addr, port))
             except OSError as e:
+                if family == socket.AF_INET6:
+                    continue   # no IPv6 on this host; v6 probes will SKIP
                 sys.exit(f'cannot listen on {addr}:{port}: {e} (another test '
                          'running, or the port is in use?)')
             server.listen(8)
@@ -284,11 +368,57 @@ def ensure_image(engine, rebuild):
     run(engine.cmd('build', '-t', IMAGE, TESTS_DIR))
 
 
+# A dedicated dual-stack network, so containers get a routable IPv6 address and
+# the IPv6 tests actually run (the default bridge has no IPv6 unless the daemon
+# is configured for it). Its interface is br-* (docker) or podman<N> (podman),
+# both matched by the after.rules br+/podman+ prefixes; ufw_setup.sh opens the
+# escape-hatch port on br+ too.
+TEST_NETWORK = 'fwtest-net'
+TEST_NETWORK_V6_SUBNET = 'fd00:f005:ba11::/64'
+_network_ready = False
+
+
+def ensure_test_network(engine):
+    """Create the dual-stack test network if absent. Returns True if we
+    created it this run (so the caller removes it afterwards), False if it
+    already existed or could not be created. Best-effort: on failure the
+    containers fall back to the default bridge and the IPv6 tests skip."""
+    global _network_ready
+    if quiet(engine.cmd('network', 'inspect', TEST_NETWORK)).returncode == 0:
+        _network_ready = True
+        return False
+    if engine.name == 'podman':
+        cmd = engine.cmd('network', 'create', '--ipv6', TEST_NETWORK)
+    else:
+        cmd = engine.cmd('network', 'create', '--ipv6',
+                         '--subnet', TEST_NETWORK_V6_SUBNET, TEST_NETWORK)
+    if quiet(cmd).returncode != 0:
+        print(f'NOTE: could not create the IPv6 test network ({TEST_NETWORK}); '
+              'IPv6 tests will be skipped. Enable IPv6 in the engine (for '
+              'docker, "ipv6": true and "ip6tables": true in daemon.json) to '
+              'test them.', file=sys.stderr)
+        _network_ready = False
+        return False
+    _network_ready = True
+    return True
+
+
+def remove_test_network(engine):
+    quiet(engine.cmd('network', 'rm', TEST_NETWORK))
+
+
+def _network_args():
+    return ['--network', TEST_NETWORK] if _network_ready else []
+
+
 def start_listener_container(engine):
     quiet(engine.cmd('rm', '-f', LISTENER_NAME))
-    spec = json.dumps({'tcp_ports': [PORT_PUBLISHED, PORT_C2C]})
+    spec = json.dumps({'tcp_ports': [PORT_PUBLISHED, PORT_PUBLISHED_OPEN,
+                                     PORT_C2C]})
     run(engine.cmd('run', '-d', '--rm', '--name', LISTENER_NAME,
+                   *_network_args(),
                    '-p', f'{PORT_PUBLISHED}:{PORT_PUBLISHED}',
+                   '-p', f'{PORT_PUBLISHED_OPEN}:{PORT_PUBLISHED_OPEN}',
                    IMAGE, 'listen', spec), capture=True)
     for _ in range(15):
         p = run(engine.cmd('logs', LISTENER_NAME),
@@ -300,16 +430,24 @@ def start_listener_container(engine):
         sys.exit('listener container did not become ready')
     p = run(engine.cmd('inspect', LISTENER_NAME), capture=True, echo=False)
     settings = json.loads(p.stdout)[0]['NetworkSettings']
-    ip = settings.get('IPAddress')
-    if not ip:
-        ip = next((n['IPAddress'] for n in settings.get('Networks', {}).values()
-                   if n.get('IPAddress')), None)
-    return ip
+
+    def pick(*keys):
+        for key in keys:
+            if settings.get(key):
+                return settings[key]
+        for net in settings.get('Networks', {}).values():
+            for key in keys:
+                if net.get(key):
+                    return net[key]
+        return None
+
+    return pick('IPAddress'), pick('GlobalIPv6Address')
 
 
 def run_container_probes(engine, spec):
     """Run container_probe.py in a throwaway container; return (env, results-by-id)."""
-    p = run(engine.cmd('run', '--rm', IMAGE, 'probe', json.dumps(spec)),
+    p = run(engine.cmd('run', '--rm', *_network_args(), IMAGE, 'probe',
+                       json.dumps(spec)),
             capture=True, timeout=120 + 4 * len(spec))
     lines = [l for l in p.stdout.splitlines() if l.strip()]
     data = json.loads(lines[-1])
@@ -461,6 +599,24 @@ def baseline_findings(results, env, host, engine):
                     f'protected the service; the port-{PORT_HOST_BLOCKED} '
                     'results show whether the firewall drop is active too.)'))
 
+    # escape hatch: ufw_setup.sh opened this host port to containers, so it
+    # must now be reachable (the counterpart to the blocked ports above)
+    res = result('host-open')
+    findings.append(Finding(
+        'host-open',
+        f'Container -> host escape-hatch port {PORT_HOST_OPEN} (opened by setup)',
+        verdict_allowed(res['outcome']), observed=describe(res),
+        meaning='The documented escape hatch works: a host port opened with '
+                '"ufw allow in on docker+/podman+" is reachable from '
+                'containers.'
+        if res['outcome'] == 'connected' else
+        f'Host port {PORT_HOST_OPEN} is not reachable from containers. Either '
+        'ufw_setup.sh has not run, or the container bridge interface does not '
+        'match the docker+/podman+ prefixes the allow rule uses.',
+        actions=[] if res['outcome'] == 'connected' else
+        ['Run: sudo tests/ufw_setup.sh',
+         'Check the interface name with: ip -o link']))
+
     outcome = result('c2c')['outcome']
     if outcome == 'connected':
         c2c_meaning = 'Containers on the bridge can communicate, as intended.'
@@ -512,7 +668,10 @@ def baseline_findings(results, env, host, engine):
         if fid not in results:
             continue
         res = results[fid]
-        verdict = verdict_blocked(res['outcome'], refused_means_reached=True)
+        # refused is NOT treated as reached: the RST/ICMP could equally come
+        # from a REJECT-style firewall rule on this host, which protects just
+        # as well as DROP; the origin is not observable from the container
+        verdict = verdict_blocked(res['outcome'], refused_means_reached=False)
         actions = []
         if verdict == INSECURE:
             actions = containment_actions(engine)
@@ -521,32 +680,55 @@ def baseline_findings(results, env, host, engine):
                            'traffic is redirected to the host itself; the '
                            'response may come from the host, not the '
                            'router.'] + actions
-        else:
+        elif verdict == SECURE:
             actions = ['To deliberately allow LAN access for containers, add '
                        'explicit ACCEPT rules to the DOCKER-USER section']
+        if verdict == SECURE:
+            meaning = 'Containers cannot reach other machines on the LAN.'
+        elif verdict == INSECURE:
+            meaning = ('Container traffic reached a network stack at the LAN '
+                       'gateway address; code running in containers can leave '
+                       'its confinement.')
+        elif res['outcome'] == 'refused':
+            meaning = ('The connection was rejected. That can mean the packet '
+                       'reached the gateway and hit a closed port (traffic '
+                       'escaped containment), or that a REJECT-style firewall '
+                       'rule on this host answered (traffic was blocked); the '
+                       'origin of the rejection is not observable from the '
+                       'container. after.rules uses DROP, so with these rules '
+                       'active the expected outcome is a timeout. '
+                       'tests/cross_host_tests.py settles this question by '
+                       'observing arrivals on another machine.')
+        else:
+            meaning = (f'The probe did not produce a usable observation '
+                       f'({res["outcome"]}).')
         findings.append(Finding(
             fid, f'Container -> LAN gateway {host.gateway} (port {port})',
-            verdict, observed=describe(res),
-            meaning='Containers cannot reach other machines on the LAN.'
-            if verdict == SECURE else
-            'Container traffic reached a network stack at the LAN gateway '
-            'address; code running in containers can leave its confinement.'
-            if verdict == INSECURE else '',
-            actions=actions))
+            verdict, observed=describe(res), meaning=meaning, actions=actions))
 
-    for fid, label in (('inet-tcp', f'{INTERNET_TCP[0]}:{INTERNET_TCP[1]} tcp'),
-                       ('inet-dns', f'{INTERNET_DNS}:53 udp')):
-        if fid not in results:
-            continue
-        outcome = results[fid]['outcome']
+    # container -> internet: expected reachable. If the host itself has no
+    # internet, the container can't either, so skip rather than report a
+    # misleading RESTRICTED.
+    if host.internet4 is False:
         findings.append(Finding(
-            fid, f'Container -> internet ({label})',
-            verdict_allowed(outcome), observed=outcome,
-            meaning='Containers can reach the public internet, as intended.'
-            if verdict_allowed(outcome) == OK else
-            'Containers appear to have no internet access. If this host is '
-            f'offline that is expected; otherwise check the "-i {engine.bridge_prefix}+ -j RETURN" '
-            'rules in DOCKER-USER.'))
+            'inet', 'Container -> internet', SKIPPED,
+            observed='host has no internet route',
+            meaning='This host cannot reach the internet, so the container '
+                    'internet-access check is not meaningful.'))
+    else:
+        for fid, label in (('inet-tcp', f'{INTERNET_TCP[0]}:{INTERNET_TCP[1]} tcp'),
+                           ('inet-dns', f'{INTERNET_DNS}:53 udp')):
+            if fid not in results:
+                continue
+            outcome = results[fid]['outcome']
+            findings.append(Finding(
+                fid, f'Container -> internet ({label})',
+                verdict_allowed(outcome), observed=outcome,
+                meaning='Containers can reach the public internet, as intended.'
+                if verdict_allowed(outcome) == OK else
+                'Containers have no internet access even though the host does; '
+                f'check the "-i {engine.bridge_prefix}+ -j RETURN" rules in '
+                'DOCKER-USER.'))
 
     # informational: host -> published port takes a different firewall path
     outcome = probes.tcp_probe(host.lan_ip or '127.0.0.1', PORT_PUBLISHED)
@@ -561,283 +743,209 @@ def baseline_findings(results, env, host, engine):
     return findings
 
 
-# --- phase 2: guided ufw escape hatch ---------------------------------------
-
-def prompt_step(text):
-    print()
-    print(text)
-    return input('Press Enter when done (or "s" to skip): ').strip().lower() != 's'
+SECTION_V6 = 'Baseline (IPv6)'
 
 
-class UfwStash:
-    """Temporary ufw rules the user is asked to add, and the stash of
-    /etc/ufw/user.rules taken before the first one so everything can be
-    restored in one step at the end of the run."""
-
-    STASH_CMDS = ('sudo cp -a /etc/ufw/user.rules /etc/ufw/user.rules.fwtest\n'
-                  '    sudo cp -a /etc/ufw/user6.rules /etc/ufw/user6.rules.fwtest')
-    RESTORE_CMDS = ('sudo cp -a /etc/ufw/user.rules.fwtest /etc/ufw/user.rules\n'
-                    '    sudo cp -a /etc/ufw/user6.rules.fwtest /etc/ufw/user6.rules\n'
-                    '    sudo ufw reload\n'
-                    '    sudo rm /etc/ufw/user.rules.fwtest /etc/ufw/user6.rules.fwtest')
-
-    FILES = ('/etc/ufw/user.rules', '/etc/ufw/user6.rules')
-    SUFFIX = '.fwtest'
-
-    def __init__(self):
-        self.offered = False
-        self.stashed = False
-        self.delete_cmds = []   # fallback if the user declined the stash
-
-    def check(self, prompted_at):
-        """Verify the stash via stat() metadata (the files are not readable
-        without root, but /etc/ufw is searchable): each stash file must
-        exist and match its original in size and mtime (cp -a preserves the
-        mtime, so a faithful copy of the *current* file matches exactly; an
-        outdated backup of since-changed rules shows up as a mismatch). A
-        stash that matches but predates the prompt (ctime) is accepted with
-        a note: it is identical to the current rules, so it is a valid
-        restore point even though this run did not create it.
-
-        Returns (problems, notes): problems mean the stash is not usable;
-        notes are informational."""
-        problems, notes = [], []
-        for orig in self.FILES:
-            stash = orig + self.SUFFIX
-            try:
-                orig_stat = os.stat(orig)
-            except FileNotFoundError:
-                continue  # nothing to stash for this file
-            except OSError as e:
-                notes.append(f'cannot verify {orig}: {e}')
-                continue
-            try:
-                stash_stat = os.stat(stash)
-            except FileNotFoundError:
-                problems.append(f'{stash} does not exist')
-                continue
-            except OSError as e:
-                notes.append(f'cannot verify {stash}: {e}')
-                continue
-            if stash_stat.st_size != orig_stat.st_size \
-                    or stash_stat.st_mtime_ns != orig_stat.st_mtime_ns:
-                problems.append(
-                    f'{stash} differs from {orig} in size or mtime. If you just copied '
-                    'it, use cp -a. But if this stash is from an earlier '
-                    'test run whose restore was skipped, it is your clean '
-                    'restore point: restore it instead of overwriting it '
-                    '(check for leftover test rules first: sudo ufw show '
-                    'added | grep 655).')
-            elif stash_stat.st_ctime < prompted_at:
-                notes.append(f'{stash} already existed and matches the current '
-                             'rules; using it as the restore point.')
-        return problems, notes
-
-    def ensure(self):
-        """Offer the stash once, before the first temporary rule is added,
-        and verify the user actually took it."""
-        if self.offered:
-            return
-        self.offered = True
-        text = ('Before adding temporary rules, stash the current ufw user '
-                'rules so everything can be restored in one step at the end '
-                '(a skipped stash means individual delete commands later):'
-                f'\n\n    {self.STASH_CMDS}')
-        while True:
-            prompted_at = time.time()
-            if not prompt_step(text):
-                self.stashed = False
-                return
-            problems, notes = self.check(prompted_at)
-            for note in notes:
-                print(f'NOTE: {note}')
-            if not problems:
-                if not notes:
-                    print('Stash verified: it exists and matches the '
-                          'current rules files.')
-                self.stashed = True
-                return
-            print('The stash does not check out:')
-            for problem in problems:
-                print(f'  - {problem}')
-            text = f'Please run the stash commands:\n\n    {self.STASH_CMDS}'
-
-    def note(self, delete_cmd):
-        self.delete_cmds.append(delete_cmd)
+def _v6_block(outcome, positive):
+    """Verdict for a v6 probe that must be blocked. Only a timeout can count
+    as SECURE, and only when a positive control proves the path would
+    otherwise work -- over IPv6 an absent route (ULA without NAT66, no
+    upstream v6) also produces a timeout, so without that proof "not
+    reachable" is ambiguous. An 'unreachable' outcome is a *local* no-route
+    error: the packet never left the container and the firewall was not
+    exercised, so it is never SECURE. A successful connection is always a
+    firm leak."""
+    if outcome == 'connected':
+        return INSECURE
+    if outcome.startswith('skipped'):
+        return SKIPPED
+    if outcome == 'timeout':
+        return SECURE if positive else INCONCLUSIVE
+    return INCONCLUSIVE   # refused, unreachable, error
 
 
-def guided_phase(engine, args, findings, stash):
-    section = 'Guided (temporary ufw rules)'
-    if args.no_guided or not sys.stdin.isatty():
+def _v6_not_reachable_meaning(outcome, control_gap):
+    """Explanation for an INCONCLUSIVE v6 block probe, matched to the actual
+    cause instead of a one-size-only text."""
+    if outcome == 'refused':
+        return REFUSED_MEANING
+    if outcome == 'unreachable':
+        return ('The container has no route to this address: the connection '
+                'failed locally and no packet ever left the container, so '
+                'the firewall was not exercised.')
+    if outcome.startswith('error'):
+        return f'The probe failed before any packet was sent ({outcome}).'
+    return (f'Not reachable, but {control_gap}, so a real block cannot be '
+            'told apart from the container simply having no IPv6 path.')
+
+
+def baseline_findings_v6(results, env, host, engine):
+    """Interpret the IPv6 probes under the "block beyond the host" contract:
+    container -> host is blocked like IPv4, and everything past the host (LAN
+    and internet alike) is blocked too -- so, unlike IPv4, a reachable v6
+    internet target is INSECURE, not OK.
+
+    A blocked v6 probe is only reported SECURE when a positive control shows
+    the path would otherwise be usable; otherwise it is INCONCLUSIVE, because
+    an unconfigured IPv6 setup blocks the same traffic the firewall would."""
+    findings = []
+
+    # v6 availability: host must have a routable v6 address AND the engine must
+    # have given the probe container one
+    if not host.ipv6:
         findings.append(Finding(
-            'guided', f'ufw escape-hatch test (port {PORT_GUIDED})', SKIPPED,
-            meaning='Skipped ({}). Run interactively without --no-guided to '
-                    'verify that the documented "ufw allow in on {}+" escape '
-                    'hatch works.'.format('--no-guided' if args.no_guided else 'no tty',
-                       engine.bridge_prefix),
-            section=section))
-        return
-    prefix = engine.bridge_prefix
-    allow_cmd = f'sudo ufw allow in on {prefix}+ to any port {PORT_GUIDED}'
+            'v6-skip', 'IPv6 tests', SKIPPED,
+            meaning='This host has no routable IPv6 address, so IPv6 '
+                    'containment could not be tested.', section=SECTION_V6))
+        return findings
+    if not env.get('self_ip6'):
+        findings.append(Finding(
+            'v6-skip', 'IPv6 tests', SKIPPED,
+            meaning='The engine did not assign the probe container a routable '
+                    'IPv6 address (container IPv6 is off), so there is nothing '
+                    'to test. after6.rules still governs any container that '
+                    'does get IPv6.', section=SECTION_V6))
+        return findings
 
-    # pre-check: the demonstration only means something if the port starts
-    # out blocked
-    print(f'Checking that port {PORT_GUIDED} starts out blocked...')
-    _, results = run_container_probes(engine, [
-        {'id': 'pre', 'kind': 'tcp', 'host': '@gateway', 'port': PORT_GUIDED},
-    ])
-    pre_open = results['pre']['outcome'] == 'connected'
-    if pre_open:
-        findings.append(Finding(
-            'guided-pre',
-            f'Container -> host port {PORT_GUIDED} before any allow rule',
-            INSECURE, observed=describe(results['pre']),
-            meaning='The escape-hatch port is reachable before any ufw allow '
-                    'rule was added (this matches the container->host '
-                    'findings above).',
-            actions=containment_actions(engine), section=section))
+    def result(fid):
+        return results.get(fid, {'outcome': 'skipped: probe not run'})
 
-    stash.ensure()
-    if not prompt_step('This step verifies the documented escape hatch. '
-                       f'In another terminal, run:\n\n    {allow_cmd}'):
-        findings.append(Finding('guided', 'ufw escape-hatch test', SKIPPED,
-                                meaning='Skipped by user.', section=section))
-        return
-    stash.note(f'sudo ufw delete allow in on {prefix}+ to any port {PORT_GUIDED}')
-    _, results = run_container_probes(engine, [
-        {'id': 'allowed', 'kind': 'tcp', 'host': '@gateway', 'port': PORT_GUIDED},
-        {'id': 'other', 'kind': 'tcp', 'host': '@gateway', 'port': PORT_HOST_BLOCKED},
-    ])
-    outcome = results['allowed']['outcome']
-    if pre_open:
-        findings.append(Finding(
-            'guided-allowed',
-            f'Container -> host port {PORT_GUIDED} with allow rule active',
-            INCONCLUSIVE,
-            observed=describe(results['allowed']),
-            meaning='The port was already reachable before the rule was '
-                    'added, so this result cannot show whether the ufw '
-                    'escape hatch has any effect.',
-            section=section))
-    else:
-        findings.append(Finding(
-            'guided-allowed',
-            f'Container -> host port {PORT_GUIDED} with allow rule active',
-            verdict_allowed(outcome),
-            observed=describe(results['allowed']),
-            meaning='The documented escape hatch works: single host ports '
-                    'can be opened to containers with ufw.'
-            if outcome == 'connected' else
-            'The allow rule had no effect. Check that your bridge interfaces '
-            'actually match the "{}+" prefix (ip -o link).{}'.format(prefix,
-               f' Rootless engine traffic does not use {prefix}+ interfaces at all, '
-               'so interface-scoped ufw rules can never match it.'
-               if engine.rootless else ''),
-            section=section))
-    outcome = results['other']['outcome']
+    # positive controls -------------------------------------------------------
+    # container <-> container, or the opened host escape-hatch port, prove the
+    # container has working IPv6 on the bridge, i.e. that the container -> host
+    # path exists (so a blocked host probe is a real block, not absent
+    # connectivity). host-open6 is the stronger control: it is the same path as
+    # the blocked host probes, just permitted.
+    c2c = result('c2c6')
+    host_open6 = result('host-open6')
+    bridge_v6 = (c2c['outcome'] == 'connected'
+                 or host_open6['outcome'] == 'connected')
+    # a globally-routable container address plus a default route means the
+    # container is provisioned to reach the IPv6 internet, so a blocked
+    # internet probe is a real block.
+    try:
+        self_global = ipaddress.ip_address(env['self_ip6']).is_global
+    except ValueError:
+        self_global = False
+    internet_capable = self_global and bool(env.get('gateway6'))
+
+    # report the positive control first so the INCONCLUSIVE verdicts below make
+    # sense to the reader
     findings.append(Finding(
-        'guided-other',
-        f'Container -> host port {PORT_HOST_BLOCKED} with allow rule active',
-        verdict_blocked(outcome, refused_means_reached=False),
-        observed=outcome,
-        meaning='Other host ports stay blocked while one is allowed.'
-        if outcome == 'timeout' else
-        f'The allow rule opened more than port {PORT_GUIDED}!'
-        if outcome == 'connected' else '',
-        section=section))
+        'c2c6', f'Container -> container over IPv6 (port {PORT_C2C})',
+        verdict_allowed(c2c['outcome']), observed=describe(c2c),
+        meaning='Containers can talk to each other over IPv6 (this also '
+                'confirms the container has usable IPv6, so the host checks '
+                'below are meaningful).'
+        if bridge_v6 else
+        'Container-to-container IPv6 is blocked; check the "-i docker+ -o '
+        'docker+ -j RETURN" rules in after6.rules.'
+        if not c2c['outcome'].startswith('skipped') else
+        'The listener container has no IPv6 address, so container IPv6 '
+        'connectivity could not be confirmed; the host checks below can only '
+        'be INCONCLUSIVE.', section=SECTION_V6))
 
-    # rule removal happens once, for all phases, in restore_phase()
+    # escape hatch over IPv6: setup opened this host port, so it must be
+    # reachable even though after6.rules otherwise blocks container -> host
+    if 'host-open6' in results:
+        findings.append(Finding(
+            'host-open6',
+            f'Container -> host escape-hatch port {PORT_HOST_OPEN} over IPv6 '
+            '(opened by setup)',
+            verdict_allowed(host_open6['outcome']), observed=describe(host_open6),
+            meaning='A host port opened with "ufw allow in on docker+/podman+" '
+                    'is reachable from containers over IPv6.'
+            if host_open6['outcome'] == 'connected' else
+            f'Host port {PORT_HOST_OPEN} is not reachable over IPv6. Either '
+            'ufw_setup.sh has not run, or the container has no usable IPv6 '
+            'path to the host.',
+            actions=[] if host_open6['outcome'] == 'connected' else
+            ['Run: sudo tests/ufw_setup.sh'], section=SECTION_V6))
 
+    # container -> host, via the v6 gateway and via the host's own v6 address.
+    # The gateway is on-link, so working bridge IPv6 (c2c) is a sufficient
+    # positive control for it; the host's own address is a *routed* target,
+    # which additionally needs the container to have a default route.
+    has_route6 = bool(env.get('gateway6'))
+    checks = (
+        ('host-gw6', f'its IPv6 gateway {env.get("gateway6")}', bridge_v6,
+         'container-to-container IPv6 did not succeed'),
+        ('host-lan6', f'host IPv6 address {host.lan_ip6}',
+         bridge_v6 and has_route6,
+         'container-to-container IPv6 did not succeed' if not bridge_v6 else
+         'the container has no IPv6 default route to reach this routed '
+         'address'),
+    )
+    for fid, target, positive, control_gap in checks:
+        res = result(fid)
+        title = f'Container -> {target} (host test port {PORT_HOST_BLOCKED})'
+        if fid == 'host-lan6' and env.get('self_ip6') \
+                and env['self_ip6'] == host.lan_ip6:
+            findings.append(Finding(
+                fid, title, INCONCLUSIVE,
+                observed='the probe container itself holds this address',
+                meaning='A user-mode network stack copied the host IPv6 '
+                        'address into the container, so this probe never '
+                        'leaves the container namespace.', section=SECTION_V6))
+            continue
+        verdict = _v6_block(res['outcome'], positive)
+        findings.append(Finding(
+            fid, title, verdict, observed=describe(res),
+            meaning='Containers cannot reach host services over IPv6.'
+            if verdict == SECURE else
+            'A container reached a host service over IPv6.'
+            if verdict == INSECURE else
+            _v6_not_reachable_meaning(res['outcome'], control_gap),
+            actions=containment_actions6(engine) if verdict == INSECURE else [],
+            section=SECTION_V6))
 
-# --- phase 3: cross-host -----------------------------------------------------
-
-# --- restore -----------------------------------------------------------------
-
-def ack_restore(text):
-    """Like prompt_step, but safe to call from a finally block: a closed
-    stdin or another Ctrl-C must not abort the cleanup instructions."""
-    print()
-    print(text)
-    try:
-        return input('Press Enter when done (or "s" to skip): ') \
-            .strip().lower() != 's'
-    except (EOFError, KeyboardInterrupt):
-        print('\n(not waiting; run the commands above when convenient)')
-        return False
-
-
-def restore_announce(findings, stash, interrupted):
-    """Print the restore (or fallback delete) commands for temporary ufw
-    rules. Returns True when the user confirmed running them. Shared with
-    cross_host_tests.py.
-
-    After an interrupt, only print the commands -- blocking on input right
-    after a Ctrl-C would look like a hang."""
-    section = 'Cleanup'
-    if not stash.delete_cmds:
-        return False
-    if interrupted:
-        if stash.stashed:
-            what, cmds = 'Restore the stashed state', stash.RESTORE_CMDS
+    # container -> internet over v6: must be blocked (the beyond-host flip).
+    # If the host itself cannot reach the IPv6 internet, the container provably
+    # cannot either (it routes through the host), so the probe is uninformative
+    # and reported as SKIPPED rather than a vague INCONCLUSIVE.
+    if host.internet6 is False:
+        findings.append(Finding(
+            'inet6', f'Container -> internet over IPv6 ({INTERNET_TCP6} tcp)',
+            SKIPPED, observed='host has no IPv6 internet route',
+            meaning='This host cannot reach the IPv6 internet, so a container '
+                    'could not either regardless of the firewall. The '
+                    'container->LAN check (cross_host_tests.py) still applies.',
+            section=SECTION_V6))
+    elif 'inet6' in results:
+        res = result('inet6')
+        verdict = _v6_block(res['outcome'], internet_capable)
+        if res['outcome'] == 'timeout':
+            # the probe only runs when the host reaches the IPv6 internet, so
+            # a timeout without the container-side control is the actionable
+            # "container IPv6 is effectively off" case
+            inconclusive_meaning = (
+                'Not reachable. The host reaches the IPv6 internet, but this '
+                'container has no globally-routable IPv6 address and default '
+                'route (e.g. Docker\'s default ULA without NAT66), so it '
+                'could not reach the internet regardless of the firewall. '
+                'Container IPv6 is effectively off; if you enable routable '
+                'container IPv6, re-run to confirm the rules block it.')
         else:
-            what, cmds = 'Remove them', '\n    '.join(stash.delete_cmds)
-        print()
-        print(f'Temporary ufw rules may still be active. {what}:\n\n    {cmds}')
+            inconclusive_meaning = _v6_not_reachable_meaning(res['outcome'], '')
         findings.append(Finding(
-            'cleanup', 'Removal of temporary ufw rules', INCONCLUSIVE,
-            observed='run interrupted; commands printed but not verified',
-            meaning='Run the printed commands to remove the temporary test '
-                    'rules, then check: sudo ufw status numbered',
-            actions=[cmds.replace('\n    ', ' && ')], section=section))
-        return False
-    if stash.stashed:
-        done = ack_restore('The run asked you to add temporary ufw rules. '
-                           f'Restore the stashed state:\n\n    {stash.RESTORE_CMDS}')
-    else:
-        done = ack_restore('The run asked you to add temporary ufw rules and '
-                           'no stash was taken. Remove them:\n\n    {}'.format('\n    '.join(stash.delete_cmds)))
-    if not done:
-        findings.append(Finding(
-            'cleanup', 'Removal of temporary ufw rules', INCONCLUSIVE,
-            observed='restore step skipped',
-            meaning='Temporary test rules may still be active on this '
-                    'system.',
-            actions=([stash.RESTORE_CMDS] if stash.stashed
-                     else stash.delete_cmds), section=section))
-    return done
+            'inet6', f'Container -> internet over IPv6 ({INTERNET_TCP6} tcp)',
+            verdict, observed=describe(res),
+            meaning='Container IPv6 egress beyond the host is blocked, as '
+                    'intended.' if verdict == SECURE else
+            'Containers have IPv6 connectivity beyond the host; after6.rules '
+            'is not installed or not effective.' if verdict == INSECURE else
+            inconclusive_meaning,
+            actions=containment_actions6(engine) if verdict == INSECURE else [],
+            section=SECTION_V6))
+    return findings
 
 
-def restore_phase(engine, findings, stash, interrupted=False):
-    """Runs in a finally block: announce the restore, then re-verify that
-    the guided escape-hatch port is blocked again."""
-    section = 'Cleanup'
-    if not restore_announce(findings, stash, interrupted):
-        return
-
-    # the guided port must be blocked again
-    try:
-        _, results = run_container_probes(engine, [
-            {'id': 'closed', 'kind': 'tcp', 'host': '@gateway',
-             'port': PORT_GUIDED},
-        ])
-        res = results['closed']
-        findings.append(Finding(
-            'cleanup-host',
-            f'Container -> host port {PORT_GUIDED} after restore',
-            SECURE if res['outcome'] != 'connected' else INSECURE,
-            observed=describe(res),
-            meaning='Restore verified; the port is blocked again.'
-            if res['outcome'] != 'connected' else
-            'The port is still reachable; a test rule appears to still be '
-            'active. Check: sudo ufw status numbered',
-            section=section))
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError) as e:
-        findings.append(Finding(
-            'cleanup-host',
-            f'Container -> host port {PORT_GUIDED} after restore',
-            INCONCLUSIVE, observed=f'verification failed: {e}',
-            meaning='Could not re-probe after the restore; check manually: '
-                    'sudo ufw status numbered', section=section))
+def containment_actions6(engine):
+    if engine.rootless:
+        return containment_actions(engine)
+    return ['Install the IPv6 rules: sudo cp ufw/after6.rules '
+            '/etc/ufw/after6.rules && sudo ufw reload',
+            'Inspect the live chains: sudo ip6tables -L DOCKER-USER -v -n']
 
 
 # --- main --------------------------------------------------------------------
@@ -849,8 +957,6 @@ def parse_args():
                              'sudo-podman = rootful podman via sudo')
     parser.add_argument('--no-internet', action='store_true',
                         help=f'do not contact {INTERNET_TCP[0]} / {INTERNET_DNS}')
-    parser.add_argument('--no-guided', action='store_true',
-                        help='skip interactive steps that ask for sudo ufw commands')
     parser.add_argument('--json', action='store_true',
                         help='machine-readable findings on stdout')
     parser.add_argument('--rebuild', action='store_true',
@@ -860,6 +966,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    require_setup()   # checks ufw_setup.sh has run (backups present, not stale)
     engine = make_engine(choose_engine_name(args))
     engine.rootless = engine_is_rootless(engine)
 
@@ -876,7 +983,7 @@ def main():
                     'engines.',
             section='Environment'))
 
-    host = HostEnv()
+    host = HostEnv(probe_internet=not args.no_internet)
     host.print_summary(engine)
     if host.rules_installed is False:
         findings.append(Finding(
@@ -893,15 +1000,15 @@ def main():
             section='Environment'))
 
     listeners = HostListeners()
-    stash = UfwStash()
-    interrupted = False
+    network_created = False
     try:
         # harness self-check: the listeners must be reachable from the host
         if probes.tcp_probe('127.0.0.1', PORT_HOST_BLOCKED) != 'connected':
             sys.exit('harness error: cannot reach own test listener')
 
         ensure_image(engine, args.rebuild)
-        listener_ip = start_listener_container(engine)
+        network_created = ensure_test_network(engine)
+        listener_ip, listener_ip6 = start_listener_container(engine)
 
         spec = [
             {'id': 'host-gw', 'kind': 'tcp', 'host': '@gateway',
@@ -915,6 +1022,9 @@ def main():
         if listener_ip:
             spec.append({'id': 'c2c', 'kind': 'tcp', 'host': listener_ip,
                          'port': PORT_C2C})
+        # escape-hatch port opened by ufw_setup.sh: must be reachable
+        spec.append({'id': 'host-open', 'kind': 'tcp', 'host': '@gateway',
+                     'port': PORT_HOST_OPEN})
         for ip in host.lan_dns:
             spec.append({'id': f'dns-udp-{ip}', 'kind': 'dns_udp', 'host': ip})
             spec.append({'id': f'dns-tcp-{ip}', 'kind': 'dns_tcp', 'host': ip})
@@ -923,18 +1033,43 @@ def main():
                          'port': 80})
             spec.append({'id': 'router-443', 'kind': 'tcp', 'host': host.gateway,
                          'port': 443})
-        if not args.no_internet:
+        # only probe container->internet when the host itself has internet;
+        # otherwise baseline_findings reports it SKIPPED
+        if not args.no_internet and host.internet4:
             spec.append({'id': 'inet-tcp', 'kind': 'tcp',
                          'host': INTERNET_TCP[0], 'port': INTERNET_TCP[1]})
             spec.append({'id': 'inet-dns', 'kind': 'dns_udp',
                          'host': INTERNET_DNS})
 
+        # IPv6 probes (interpreted by baseline_findings_v6; skipped there when
+        # the host or container has no IPv6)
+        if host.ipv6:
+            spec.append({'id': 'host-gw6', 'kind': 'tcp', 'host': '@gateway6',
+                         'port': PORT_HOST_BLOCKED})
+            spec.append({'id': 'host-lan6', 'kind': 'tcp', 'host': host.lan_ip6,
+                         'port': PORT_HOST_BLOCKED})
+            if listener_ip6:
+                spec.append({'id': 'c2c6', 'kind': 'tcp', 'host': listener_ip6,
+                             'port': PORT_C2C})
+            else:
+                spec.append({'id': 'c2c6', 'kind': 'tcp', 'host': '::1',
+                             'port': PORT_C2C,
+                             'skip': 'listener container has no IPv6 address'})
+            spec.append({'id': 'host-open6', 'kind': 'tcp', 'host': '@gateway6',
+                         'port': PORT_HOST_OPEN})
+            # only probe container->internet6 when the host itself has v6
+            # internet; otherwise baseline_findings_v6 reports it SKIPPED
+            if not args.no_internet and host.internet6:
+                ip6, port6 = INTERNET_TCP6.rsplit(':', 1)
+                spec.append({'id': 'inet6', 'kind': 'tcp',
+                             'host': ip6.strip('[]'), 'port': int(port6)})
+
         print('Running baseline probes from a container (blocked probes '
               f'take {int(probes.TIMEOUT)}s each to time out)...')
         env, results = run_container_probes(engine, spec)
         findings += baseline_findings(results, env, host, engine)
+        findings += baseline_findings_v6(results, env, host, engine)
 
-        guided_phase(engine, args, findings, stash)
         findings.append(Finding(
             'cross-host', 'Cross-host tests', SKIPPED,
             meaning='Not part of this run. Whether the engine bypasses UFW '
@@ -943,28 +1078,23 @@ def main():
                     'remote_peer.py on a second LAN host.',
             section='Cross-host'))
     except KeyboardInterrupt:
-        interrupted = True
         print('\nInterrupted.')
         findings.append(Finding(
             'interrupted', 'Run interrupted by user', INFO,
             meaning='Later phases did not run; the findings below are '
                     'partial.', section='Environment'))
     finally:
-        try:
-            # needs the host listeners and the listener container still up
-            restore_phase(engine, findings, stash, interrupted)
-        except KeyboardInterrupt:
-            print('\nInterrupted again; any outstanding cleanup commands '
-                  'were printed above.')
-        finally:
-            quiet(engine.cmd('rm', '-f', LISTENER_NAME))
-            listeners.close()
+        quiet(engine.cmd('rm', '-f', LISTENER_NAME))
+        if network_created:
+            remove_test_network(engine)
+        listeners.close()
 
     print()
     if args.json:
         print(report.render_json(findings))
     else:
         print(report.render_text(findings))
+    teardown_reminder()
     return report.exit_code(findings)
 
 
