@@ -1,0 +1,112 @@
+###############################################################################
+# Docker/Podman IPv6 integration for UFW, to be placed in /etc/ufw/after6.rules.
+#
+# IPv6 counterpart of after.rules. The containment boundary is the container's
+# own host:
+# - Host-facing rules are identical to the IPv4 file: containers may reach the
+#   host only on the DNS port or where you explicitly allow it
+#   (ufw allow in on docker+ to any port <PORT>).
+# - Everything BEYOND the host is blocked. Unlike IPv4, there is no "allow the
+#   internet, block the LAN" split: IPv6 LANs use global addresses that cannot
+#   be told apart from the public internet by range, so all container egress
+#   past the host (LAN and internet alike) is denied. Container-to-container
+#   traffic is still allowed, and specific egress can be opened with
+#   `ufw route allow`.
+#
+# Dual-stack containers simply fall back to IPv4 for outbound connectivity.
+#
+# Note: UFW's IPv6 chains use the ufw6- prefix; only DOCKER-USER keeps its name
+# (Docker uses it in both iptables and ip6tables).
+###############################################################################
+
+#
+# rules.input-after
+#
+# Rules that should be run after the ufw command line added rules. Custom
+# rules should be added to one of these chains:
+#   ufw6-after-input
+#   ufw6-after-output
+#   ufw6-after-forward
+#
+
+# Don't delete these required lines, otherwise there will be errors
+*filter
+:ufw6-after-input - [0:0]
+:ufw6-after-output - [0:0]
+:ufw6-after-forward - [0:0]
+# End required lines
+
+###############################################################################
+# BEGIN UFW DEFAULTS
+
+# don't log noisy services by default
+-A ufw6-after-input -p udp --dport 137 -j ufw6-skip-to-policy-input
+-A ufw6-after-input -p udp --dport 138 -j ufw6-skip-to-policy-input
+-A ufw6-after-input -p tcp --dport 139 -j ufw6-skip-to-policy-input
+-A ufw6-after-input -p tcp --dport 445 -j ufw6-skip-to-policy-input
+
+# don't delete the 'COMMIT' line or these rules won't be processed
+COMMIT
+# END UFW DEFAULTS
+
+###############################################################################
+# BEGIN DOCKER/PODMAN RULES
+# Inspired by <https://github.com/chaifeng/ufw-docker>
+*filter
+:ufw6-user-forward - [0:0]
+:ufw6-docker-logging-deny - [0:0]
+:DOCKER-USER - [0:0]
+
+# ufw6-docker-logging-deny ##########################################
+-A ufw6-docker-logging-deny -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix "[UFW DOCKER BLOCK] "
+-A ufw6-docker-logging-deny -j DROP
+
+# DOCKER-USER #######################################################
+-A DOCKER-USER -j ufw6-user-forward
+
+-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+-A DOCKER-USER -m conntrack --ctstate INVALID -j DROP
+
+# Allow traffic between containers
+-A DOCKER-USER -i podman+ -o podman+ -j RETURN
+-A DOCKER-USER -i podman+ -o docker+ -j RETURN
+-A DOCKER-USER -i podman+ -o br+     -j RETURN
+-A DOCKER-USER -i docker+ -o docker+ -j RETURN
+-A DOCKER-USER -i docker+ -o podman+ -j RETURN
+-A DOCKER-USER -i docker+ -o br+     -j RETURN
+-A DOCKER-USER -i br+     -o docker+ -j RETURN
+-A DOCKER-USER -i br+     -o podman+ -j RETURN
+-A DOCKER-USER -i br+     -o br+     -j RETURN
+
+# Block all container traffic beyond the host (LAN and internet alike).
+# IPv6 has no private-vs-public range split we could use to allow the internet
+# while blocking the LAN, so everything past the host is denied. Open specific
+# egress deliberately with `ufw route allow`, which is consulted via the
+# ufw6-user-forward jump above.
+-A DOCKER-USER -i podman+ -j ufw6-docker-logging-deny
+-A DOCKER-USER -i docker+ -j ufw6-docker-logging-deny
+-A DOCKER-USER -i br+     -j ufw6-docker-logging-deny
+
+# Block all other new inbound connections to containers
+-A DOCKER-USER -o podman+ -m conntrack --ctstate NEW -j ufw6-docker-logging-deny
+-A DOCKER-USER -o docker+ -m conntrack --ctstate NEW -j ufw6-docker-logging-deny
+-A DOCKER-USER -o br+     -m conntrack --ctstate NEW -j ufw6-docker-logging-deny
+
+# ufw6-after-input ##################################################
+# Container -> host is treated exactly as in the IPv4 rules: allow DNS to a
+# resolver running on the host, block everything else. Additional host ports
+# can be allowed with e.g. `ufw allow in on docker+ to any port 9003`.
+-A ufw6-after-input -i podman+ -p tcp --dport 53   -j ACCEPT
+-A ufw6-after-input -i podman+ -p udp --dport 53   -j ACCEPT
+-A ufw6-after-input -i docker+ -p tcp --dport 53   -j ACCEPT
+-A ufw6-after-input -i docker+ -p udp --dport 53   -j ACCEPT
+-A ufw6-after-input -i br+     -p tcp --dport 53   -j ACCEPT
+-A ufw6-after-input -i br+     -p udp --dport 53   -j ACCEPT
+
+# Block all other new connections from containers to the host
+-A ufw6-after-input -i podman+ -j ufw6-docker-logging-deny
+-A ufw6-after-input -i docker+ -j ufw6-docker-logging-deny
+-A ufw6-after-input -i br+     -j ufw6-docker-logging-deny
+
+COMMIT
+# END DOCKER/PODMAN RULES

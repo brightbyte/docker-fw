@@ -2,6 +2,9 @@
 
 UFW firewall rules for Docker and Podman integration, to be placed at `/etc/ufw/after.rules`.
 
+**DISCLAIMER**: The firewall rules are supplied in the hope that they will be useful,
+but **WITHOUT ANY WARANTY**. Use at your own risk.
+
 ## Problem
 
 By default, the Docker daemon manipulates `iptables` directly and bypasses UFW entirely. This means ports exposed by containers are reachable from the network even if UFW would otherwise block them.
@@ -34,10 +37,13 @@ NOTE: The containment rules DO NOT WORK for Docker or Podman running in "rootles
 ```bash
 sudo cp --backup=numbered /etc/ufw/after.rules /etc/ufw/after.backup
 sudo cp ufw/after.rules /etc/ufw/after.rules
+sudo cp --backup=numbered /etc/ufw/after6.rules /etc/ufw/after6.backup
+sudo cp ufw/after6.rules /etc/ufw/after6.rules
 sudo ufw reload
 ```
 
-Then [run tests](#testing) to confirm.
+`after6.rules` is the IPv6 counterpart; UFW loads it automatically via
+`ip6tables` (see [IPv6](#ipv6) below). Then [run tests](#testing) to confirm.
 
 ## Usage examples
 
@@ -61,6 +67,30 @@ ufw allow in on podman+ proto tcp to any port 1024:65499
 
 Note that ports 65500 and above are used by the self-test, allowing them will produce
 misleading results from `tests/host_tests.py`. So they are now allowed by the example above.
+
+## IPv6
+
+`ufw/after6.rules` is the IPv6 counterpart, installed alongside `after.rules`
+(UFW applies it automatically through `ip6tables`). The boundary it enforces is
+the container's own host:
+
+- **Container to host** is treated exactly as in IPv4: blocked by default, with
+  the same DNS carve-out and the same `ufw allow in on docker+ ...` escape
+  hatch. These rules match by interface, which works the same for both address
+  families.
+- **Everything beyond the host is blocked** — LAN and public internet alike.
+  IPv4 can allow the internet while blocking the LAN because the LAN uses
+  private (RFC 1918) ranges; IPv6 LANs use global addresses indistinguishable
+  from the internet by range, so there is no safe way to make that split. Rather
+  than leak, `after6.rules` denies all container IPv6 egress past the host.
+
+Container-to-container IPv6 still works. Dual-stack containers simply use IPv4
+for outbound connectivity. If a container genuinely needs a specific IPv6
+destination beyond the host, open it deliberately with a route rule, e.g.:
+
+```bash
+ufw route allow proto tcp from any to any port 443
+```
 
 ## Caveats
 
@@ -114,10 +144,13 @@ services bound exclusively to `127.0.0.1` stay out of reach.
 
 ## Testing
 
-The `tests/` directory contains a test suite that probes a running system for
+The `tests/` directory contains an experimental test suite that probes a running system for
 the outcomes described above and reports secure/insecure verdicts, including
-optional cross-host tests from a second machine on the LAN. See
-[tests/README.md](tests/README.md).
+optional cross-host tests from a second machine on the LAN. A one-time
+`ufw_setup.sh` / `ufw_teardown.sh` pair prepares and restores the firewall so
+the test runs themselves never change it. See [tests/README.md](tests/README.md).
+
+The test suite is supplied in the hope it will be useful, but **WITHOUT ANY WARANTY**!
 
 ## Credits
 
