@@ -79,9 +79,11 @@ COMMIT
 -A DOCKER-USER -i br+     -o podman+ -j RETURN
 -A DOCKER-USER -i br+     -o br+     -j RETURN
 
-# Allow containers to use DNS on the LAN (private IP ranges).
-# This covers routed (FORWARD) traffic to a resolver on another machine,
-# e.g. a home router; it is a carve-out from the LAN block below.
+# Allow containers to use DNS on the LAN (private IP ranges), link-local
+# (169.254.0.0/16, e.g. cloud resolvers) and CGNAT (100.64.0.0/10, e.g.
+# Tailscale MagicDNS). This covers routed (FORWARD) traffic to a resolver on
+# another machine, e.g. a home router; it is a carve-out from the LAN block
+# below.
 -A DOCKER-USER -i podman+ -d 10.0.0.0/8 -p tcp --dport 53   -j ACCEPT
 -A DOCKER-USER -i podman+ -d 10.0.0.0/8 -p udp --dport 53   -j ACCEPT
 -A DOCKER-USER -i docker+ -d 10.0.0.0/8 -p tcp --dport 53   -j ACCEPT
@@ -103,7 +105,24 @@ COMMIT
 -A DOCKER-USER -i br+     -d 192.168.0.0/16 -p tcp --dport 53   -j ACCEPT
 -A DOCKER-USER -i br+     -d 192.168.0.0/16 -p udp --dport 53   -j ACCEPT
 
-# Block containers from reaching LAN (private IP ranges)
+-A DOCKER-USER -i podman+ -d 169.254.0.0/16 -p tcp --dport 53   -j ACCEPT
+-A DOCKER-USER -i podman+ -d 169.254.0.0/16 -p udp --dport 53   -j ACCEPT
+-A DOCKER-USER -i docker+ -d 169.254.0.0/16 -p tcp --dport 53   -j ACCEPT
+-A DOCKER-USER -i docker+ -d 169.254.0.0/16 -p udp --dport 53   -j ACCEPT
+-A DOCKER-USER -i br+     -d 169.254.0.0/16 -p tcp --dport 53   -j ACCEPT
+-A DOCKER-USER -i br+     -d 169.254.0.0/16 -p udp --dport 53   -j ACCEPT
+
+-A DOCKER-USER -i podman+ -d 100.64.0.0/10 -p tcp --dport 53   -j ACCEPT
+-A DOCKER-USER -i podman+ -d 100.64.0.0/10 -p udp --dport 53   -j ACCEPT
+-A DOCKER-USER -i docker+ -d 100.64.0.0/10 -p tcp --dport 53   -j ACCEPT
+-A DOCKER-USER -i docker+ -d 100.64.0.0/10 -p udp --dport 53   -j ACCEPT
+-A DOCKER-USER -i br+     -d 100.64.0.0/10 -p tcp --dport 53   -j ACCEPT
+-A DOCKER-USER -i br+     -d 100.64.0.0/10 -p udp --dport 53   -j ACCEPT
+
+# Block containers from reaching LAN (private IP ranges), link-local and CGNAT.
+# Link-local covers cloud metadata services (169.254.169.254) that hand out
+# instance credentials; 100.64.0.0/10 covers Tailscale/Netbird tailnets, which
+# the host's node would otherwise expose to containers via masquerading.
 -A DOCKER-USER -i podman+ -d 10.0.0.0/8     -j ufw-docker-logging-deny
 -A DOCKER-USER -i podman+ -d 172.16.0.0/12  -j ufw-docker-logging-deny
 -A DOCKER-USER -i podman+ -d 192.168.0.0/16 -j ufw-docker-logging-deny
@@ -113,6 +132,12 @@ COMMIT
 -A DOCKER-USER -i br+     -d 10.0.0.0/8     -j ufw-docker-logging-deny
 -A DOCKER-USER -i br+     -d 172.16.0.0/12  -j ufw-docker-logging-deny
 -A DOCKER-USER -i br+     -d 192.168.0.0/16 -j ufw-docker-logging-deny
+-A DOCKER-USER -i podman+ -d 169.254.0.0/16 -j ufw-docker-logging-deny
+-A DOCKER-USER -i docker+ -d 169.254.0.0/16 -j ufw-docker-logging-deny
+-A DOCKER-USER -i br+     -d 169.254.0.0/16 -j ufw-docker-logging-deny
+-A DOCKER-USER -i podman+ -d 100.64.0.0/10  -j ufw-docker-logging-deny
+-A DOCKER-USER -i docker+ -d 100.64.0.0/10  -j ufw-docker-logging-deny
+-A DOCKER-USER -i br+     -d 100.64.0.0/10  -j ufw-docker-logging-deny
 
 # Allow containers to reach the public internet
 -A DOCKER-USER -i podman+ -j RETURN

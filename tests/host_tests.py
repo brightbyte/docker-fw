@@ -61,6 +61,15 @@ INTERNET_TCP6 = '[2606:4700:4700::1111]:443'   # Cloudflare, v6 literal
 
 RFC1918 = [ipaddress.ip_network(n)
            for n in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')]
+# further ranges after.rules blocks for containers: link-local (cloud
+# metadata, zeroconf) and CGNAT (Tailscale/Netbird)
+LINK_LOCAL = ipaddress.ip_network('169.254.0.0/16')
+CGNAT = ipaddress.ip_network('100.64.0.0/10')
+BLOCKED_RANGES = RFC1918 + [LINK_LOCAL, CGNAT]
+# addresses probed to show those two ranges are blocked: the cloud metadata
+# endpoint, and an arbitrary tailnet-style address
+METADATA_IP = '169.254.169.254'
+CGNAT_IP = '100.64.0.1'
 
 
 def run(cmd, capture=False, check=True, timeout=None, echo=True):
@@ -167,15 +176,15 @@ class HostEnv:
         self.internet6 = (self._internet6()
                           if self.ipv6 and probe_internet else None)
         self.dns_servers = self._dns_servers()
-        self.lan_dns = [ip for ip in self.dns_servers if self._is_rfc1918(ip)]
+        self.lan_dns = [ip for ip in self.dns_servers if self._is_blocked_range(ip)]
         self.loopback_dns = [ip for ip in self.dns_servers
                              if ipaddress.ip_address(ip).is_loopback]
         self.rules_installed = self._rules_installed()
 
     @staticmethod
-    def _is_rfc1918(ip):
+    def _is_blocked_range(ip):
         addr = ipaddress.ip_address(ip)
-        return any(addr in net for net in RFC1918)
+        return any(addr in net for net in BLOCKED_RANGES)
 
     @staticmethod
     def _default_route():
@@ -660,7 +669,8 @@ def baseline_findings(results, env, host, engine):
     if not host.lan_dns:
         findings.append(Finding(
             'dns-none', 'Container -> DNS on host or LAN', SKIPPED,
-            meaning='No RFC-1918 DNS server detected on this host (resolver: '
+            meaning='No DNS server in a blocked range (RFC 1918, link-local, '
+                    'CGNAT) detected on this host (resolver: '
                     '%s). The port-53 carve-out could not be probed.'
                     % (', '.join(host.dns_servers) or 'none')))
 
@@ -705,6 +715,28 @@ def baseline_findings(results, env, host, engine):
         findings.append(Finding(
             fid, f'Container -> LAN gateway {host.gateway} (port {port})',
             verdict, observed=describe(res), meaning=meaning, actions=actions))
+
+    for fid, title, what in (
+            ('metadata', f'Container -> link-local {METADATA_IP} (cloud metadata)',
+             'link-local addresses (cloud metadata services, zeroconf devices)'),
+            ('cgnat', f'Container -> CGNAT {CGNAT_IP} (Tailscale/Netbird range)',
+             'CGNAT addresses (a Tailscale/Netbird tailnet the host belongs to)')):
+        if fid not in results:
+            continue
+        res = results[fid]
+        # no machine need exist at these addresses, so a timeout only shows
+        # that nothing answered; refused is not treated as reached for the
+        # same reason as the LAN gateway probes
+        verdict = verdict_blocked(res['outcome'], refused_means_reached=False)
+        findings.append(Finding(
+            fid, title, verdict, observed=describe(res),
+            meaning={
+                SECURE: f'Nothing answered; containers cannot reach {what}.',
+                INSECURE: f'Container traffic reached {what}; code running '
+                          'in containers can leave its confinement.',
+                INCONCLUSIVE: REFUSED_MEANING,
+            }.get(verdict, ''),
+            actions=containment_actions(engine) if verdict == INSECURE else []))
 
     # container -> internet: expected reachable. If the host itself has no
     # internet, the container can't either, so skip rather than report a
@@ -1033,6 +1065,10 @@ def main():
                          'port': 80})
             spec.append({'id': 'router-443', 'kind': 'tcp', 'host': host.gateway,
                          'port': 443})
+        spec.append({'id': 'metadata', 'kind': 'tcp', 'host': METADATA_IP,
+                     'port': 80})
+        spec.append({'id': 'cgnat', 'kind': 'tcp', 'host': CGNAT_IP,
+                     'port': 80})
         # only probe container->internet when the host itself has internet;
         # otherwise baseline_findings reports it SKIPPED
         if not args.no_internet and host.internet4:

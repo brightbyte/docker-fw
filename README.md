@@ -21,14 +21,16 @@ The rules in `ufw/after.rules` will ensure that incoming traffic can only reach 
 
 - **Prevent Docker from bypassing UFW** for exposed ports — inbound connections to containers are subject to UFW route rules (e.g. `ufw route allow proto tcp from any to any port 8000`).
 - **Block containers from reaching the LAN** (RFC 1918 ranges: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`).
+- **Block containers from reaching link-local addresses** (`169.254.0.0/16`: cloud metadata services such as `169.254.169.254`, which hand out instance credentials, and zeroconf devices).
+- **Block containers from reaching CGNAT addresses** (`100.64.0.0/10`: Tailscale, Netbird and Headscale nodes). Docker masquerades container traffic, so without this rule a container reaches the whole tailnet as the host's node. To deliberately give containers access to a tailnet, use a ufw route rule, e.g. `ufw route allow in on docker+ to 100.64.0.0/10`.
 - **Block containers from reaching the host** (host ports can be allowed with `ufw allow in on docker+ to any port <PORT>`).
 
 Note that traffic from containers is identified based on the device name prefix such as `docker+` or `podman+`. So the rules will not interfere with traffic in a local LAN that uses addresses in the ranges `10.0.0.0/8` and `172.16.0.0/12`, which are also typically used by Docker and Podman.
 
 Containers are still allowed to:
-- **Use local DNS** — containers may query DNS servers on the LAN and on the host.
+- **Use local DNS** — containers may query DNS servers on the LAN, on the host, and in the link-local and CGNAT ranges (cloud resolvers, Tailscale MagicDNS).
 - **Talk to other containers** — forwarding between interfaces matching prefixes such as `docker+` is permitted.
-- **Access the internet** — containers can reach public IP addresses (but not addresses on the LAN).
+- **Access the internet** — containers can reach public IP addresses (but not addresses on the LAN, link-local or CGNAT ranges).
 
 NOTE: The containment rules DO NOT WORK for Docker or Podman running in "rootless" mode, since they would be using a user-space network stack and their traffic is indistinguishable from the user's. For details and other exceptions see the [Caveats](#caveats) section below.
 
