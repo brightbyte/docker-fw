@@ -103,6 +103,13 @@ COMMIT
 -A ufw6-after-input -i br+     -p tcp --dport 53   -j ACCEPT
 -A ufw6-after-input -i br+     -p udp --dport 53   -j ACCEPT
 
+# Drop discovery multicast without logging: WS-Discovery (3702) and Steam
+# (27036). The host sends these on every interface, and the copies looped back
+# on the bridges would otherwise flood the log.
+-A ufw6-after-input -i podman+ -d ff00::/8 -p udp -m multiport --dports 3702,27036 -j DROP
+-A ufw6-after-input -i docker+ -d ff00::/8 -p udp -m multiport --dports 3702,27036 -j DROP
+-A ufw6-after-input -i br+     -d ff00::/8 -p udp -m multiport --dports 3702,27036 -j DROP
+
 # Block all other new connections from containers to the host
 -A ufw6-after-input -i podman+ -j ufw6-docker-logging-deny
 -A ufw6-after-input -i docker+ -j ufw6-docker-logging-deny

@@ -164,6 +164,13 @@ COMMIT
 # E.g. to allow allow PHP code to talk to xdebug an an IDE, use something like
 #   ufw allow in on docker+ to any port 9003
 
+# Drop discovery multicast without logging: WS-Discovery (3702) and Steam
+# (27036). The host sends these on every interface, and the copies looped back
+# on the bridges would otherwise flood the log.
+-A ufw-after-input -i podman+ -d 224.0.0.0/4 -p udp -m multiport --dports 3702,27036 -j DROP
+-A ufw-after-input -i docker+ -d 224.0.0.0/4 -p udp -m multiport --dports 3702,27036 -j DROP
+-A ufw-after-input -i br+     -d 224.0.0.0/4 -p udp -m multiport --dports 3702,27036 -j DROP
+
 # Block all other new connections from Docker containers to the host
 -A ufw-after-input -i podman+ -j ufw-docker-logging-deny
 -A ufw-after-input -i docker+ -j ufw-docker-logging-deny
