@@ -36,6 +36,8 @@ NOTE: The containment rules DO NOT WORK for Docker or Podman running in "rootles
 
 ## Installation
 
+Run `sudo ./install.sh`, which does the following:
+
 ```bash
 sudo cp --backup=numbered /etc/ufw/after.rules /etc/ufw/after.backup
 sudo cp ufw/after.rules /etc/ufw/after.rules
