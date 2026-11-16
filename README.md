@@ -72,6 +72,24 @@ ufw allow in on podman+ proto tcp to any port 1024:65499
 Note that ports 65500 and above are used by the self-test, allowing them will produce
 misleading results from `tests/host_tests.py`. So they are now allowed by the example above.
 
+## Reviewing blocked packets
+
+Blocked container traffic is logged to the kernel log with the prefix
+`[UFW DOCKER BLOCK]`. `log.sh` shows these entries, one line per packet,
+reduced to the interfaces, addresses, protocol and ports. Arguments are passed
+on to `journalctl`:
+
+```bash
+./log.sh --since "1 hour ago"
+./log.sh -f
+```
+
+Reading the kernel log needs root or membership in the `adm` or
+`systemd-journal` group. Logging is rate-limited to 3 packets per minute
+(bursts of up to 10), so the log is a sample of the blocked traffic, not a
+complete record. For the full entries, use
+`journalctl -k --grep 'UFW DOCKER BLOCK'`.
+
 ## IPv6
 
 `ufw/after6.rules` is the IPv6 counterpart, installed alongside `after.rules`
