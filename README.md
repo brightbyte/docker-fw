@@ -82,13 +82,14 @@ on to `journalctl`:
 ```bash
 ./log.sh --since "1 hour ago"
 ./log.sh -f
+./log.sh -b    # current boot only
 ```
 
 Reading the kernel log needs root or membership in the `adm` or
 `systemd-journal` group. Logging is rate-limited to 3 packets per minute
 (bursts of up to 10), so the log is a sample of the blocked traffic, not a
 complete record. For the full entries, use
-`journalctl -k --grep 'UFW DOCKER BLOCK'`.
+`journalctl _TRANSPORT=kernel --grep 'UFW DOCKER BLOCK'`.
 
 ## IPv6
 
